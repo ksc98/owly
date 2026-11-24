@@ -208,10 +208,11 @@ mod tests {
             (Mode::ActiveMonitor, vec![149, 44, 6])
         );
         assert!(usb.rx_ampdu, "legacy turned -A on there");
+        // Legacy ran it as an active monitor, which kernel 7.3 no longer
+        // offers on mt792x: a hidden AP instead, 149 first.
         let (mt7921, _) = quirks.get("mt7921e", None);
-        assert_eq!(mt7921.mode, Mode::ActiveMonitor);
-        assert_eq!(mt7921.channels, [6]);
-        assert!(!mt7921.issues.is_empty());
+        assert_eq!(mt7921.mode, Mode::Exclusive);
+        assert_eq!(mt7921.channels, [149, 44, 6]);
     }
 
     #[test]
