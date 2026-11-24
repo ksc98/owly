@@ -8,7 +8,7 @@
 //! tries the radio's AWDL peers beside mDNS (DISC-5), both as owlyd's D-Bus
 //! API says.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use owly_airdrop::driver::mdns::Mdns;
-use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent};
+use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent, Request};
 use owly_airdrop::driver::sender::{Event, Payload, Sender};
 use owly_airdrop::driver::tls::Identity;
 use owly_airdrop::proto::ble::Advert;
@@ -687,67 +687,99 @@ async fn run_receiver(
     );
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut pending: Option<Request> = None;
+    let mut queued: VecDeque<Request> = VecDeque::new();
     loop {
-        let event = tokio::select! {
-            event = events.recv() => event,
+        tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
-        };
-        let Some(event) = event else {
-            return Ok(ExitCode::SUCCESS);
-        };
-        match event {
-            ReceiverEvent::Discovered { peer, .. } => eprintln!("seen by {peer}"),
-            ReceiverEvent::Request(request) => {
-                // SEC-4: everything here is the sender's; {:?} escapes it.
-                eprintln!(
-                    "{:?} ({:?}) wants to send:",
-                    request.ask.sender_computer_name, request.ask.sender_model_name
-                );
-                match &request.ask.offer {
-                    Offer::Files(files) => {
-                        for f in files {
-                            eprintln!(
-                                "  {:?} {} {}",
-                                f.name,
-                                f.file_type,
-                                f.size.map(|s| format!("{s} bytes")).unwrap_or_default()
-                            );
+            line = stdin.next_line(), if pending.is_some() => {
+                let request = pending.take().unwrap();
+                match line {
+                    Ok(Some(line)) if line.trim().eq_ignore_ascii_case("y") => request.accept(),
+                    _ => request.decline(),
+                }
+                pending = next_prompt(&mut queued);
+            }
+            event = events.recv() => {
+                let Some(event) = event else {
+                    return Ok(ExitCode::SUCCESS);
+                };
+                match event {
+                    ReceiverEvent::Discovered { peer, .. } => eprintln!("seen by {peer}"),
+                    ReceiverEvent::Request(request) => {
+                        if accept {
+                            show_offer(&request);
+                            request.accept();
+                        } else if pending.is_none() {
+                            prompt_offer(&request);
+                            pending = Some(request);
+                        } else {
+                            queued.push_back(request);
                         }
                     }
-                    Offer::Urls(urls) => {
+                    ReceiverEvent::Withdrawn { id } => {
+                        if pending.as_ref().is_some_and(|r| r.id == id) {
+                            eprintln!("\nthe request was withdrawn");
+                            pending = next_prompt(&mut queued);
+                        } else if let Some(pos) = queued.iter().position(|r| r.id == id) {
+                            queued.remove(pos);
+                            eprintln!("a queued request was withdrawn");
+                        } else {
+                            eprintln!("the request was withdrawn");
+                        }
+                    }
+                    // SEC-4: shown, never opened.
+                    ReceiverEvent::Urls { urls, .. } => {
                         for u in urls {
-                            eprintln!("  {u:?}");
+                            println!("{u:?}");
                         }
                     }
-                }
-                if accept {
-                    request.accept();
-                    continue;
-                }
-                eprint!("accept? [y/N] ");
-                // ASK-2: the receiver declines by itself after 15 s.
-                let answer = tokio::time::timeout(Duration::from_secs(15), stdin.next_line()).await;
-                match answer {
-                    Ok(Ok(Some(line))) if line.trim().eq_ignore_ascii_case("y") => request.accept(),
-                    Ok(_) => request.decline(),
-                    Err(_) => eprintln!("\ntimed out"),
+                    ReceiverEvent::Received { paths, .. } => {
+                        for p in paths {
+                            println!("{}", p.display());
+                        }
+                    }
+                    ReceiverEvent::Failed { reason, .. } => eprintln!("transfer failed: {reason}"),
                 }
             }
-            ReceiverEvent::Withdrawn { .. } => eprintln!("the request was withdrawn"),
-            // SEC-4: shown, never opened.
-            ReceiverEvent::Urls { urls, .. } => {
-                for u in urls {
-                    println!("{u:?}");
-                }
-            }
-            ReceiverEvent::Received { paths, .. } => {
-                for p in paths {
-                    println!("{}", p.display());
-                }
-            }
-            ReceiverEvent::Failed { reason, .. } => eprintln!("transfer failed: {reason}"),
         }
     }
+}
+
+fn show_offer(request: &Request) {
+    // SEC-4: everything here is the sender's; {:?} escapes it.
+    eprintln!(
+        "{:?} ({:?}) wants to send:",
+        request.ask.sender_computer_name, request.ask.sender_model_name
+    );
+    match &request.ask.offer {
+        Offer::Files(files) => {
+            for f in files {
+                eprintln!(
+                    "  {:?} {} {}",
+                    f.name,
+                    f.file_type,
+                    f.size.map(|s| format!("{s} bytes")).unwrap_or_default()
+                );
+            }
+        }
+        Offer::Urls(urls) => {
+            for u in urls {
+                eprintln!("  {u:?}");
+            }
+        }
+    }
+}
+
+fn prompt_offer(request: &Request) {
+    show_offer(request);
+    eprint!("accept? [y/N] ");
+}
+
+fn next_prompt(queued: &mut VecDeque<Request>) -> Option<Request> {
+    let request = queued.pop_front()?;
+    prompt_offer(&request);
+    Some(request)
 }
 
 #[cfg(test)]

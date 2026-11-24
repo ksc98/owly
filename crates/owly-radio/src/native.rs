@@ -17,6 +17,7 @@ use crate::radio::{MacAddr, PeerInfo};
 use owly_awdl::driver::{self, Air, Netif, Received, Running};
 use owly_awdl::frame::Frame;
 use owly_awdl::{Config, Ipv6Packet};
+use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
@@ -77,6 +78,7 @@ impl Native {
                 let monitor = Monitor {
                     fd: register(air)?,
                     buf: vec![0; 16 * 1024],
+                    tx_buf: Vec::with_capacity(2048),
                 };
                 let tap = Tap {
                     fd: register(tap_fd)?,
@@ -108,6 +110,7 @@ impl Native {
 struct Monitor {
     fd: AsyncFd<OwnedFd>,
     buf: Vec<u8>,
+    tx_buf: Vec<u8>,
 }
 
 impl Air for Monitor {
@@ -117,9 +120,23 @@ impl Air for Monitor {
             let read = guard.try_io(|fd| Ok(nix::unistd::read(fd.get_ref(), &mut self.buf)?));
             match read {
                 Ok(Ok(n)) => {
-                    if let Some(rx) = radiotap::parse(&self.buf[..n]) {
+                    if let Some((rx, has_fcs)) = radiotap::parse_header(&self.buf[..n]) {
+                        // Drop unrelated 802.11 traffic (beacons, control frames,
+                        // neighbor AP data) before searching for an unflagged FCS
+                        // or allocating a Vec.
+                        if matches!(
+                            owly_awdl::frame::parse(rx.frame),
+                            Ok(owly_awdl::frame::Received::Other)
+                        ) {
+                            continue;
+                        }
+                        let frame = if has_fcs {
+                            rx.frame
+                        } else {
+                            radiotap::strip_unflagged_fcs(rx.frame)
+                        };
                         return Ok(Received {
-                            bytes: rx.frame.to_vec(),
+                            bytes: frame.to_vec(),
                             rssi: rx.rssi,
                         });
                     }
@@ -136,9 +153,10 @@ impl Air for Monitor {
     }
 
     fn send(&mut self, frame: Frame) -> Result<(), Frame> {
-        let mut buf = radiotap::tx_header(frame.rate, frame.no_ack);
-        buf.extend_from_slice(&frame.bytes);
-        match nix::unistd::write(self.fd.get_ref(), &buf) {
+        self.tx_buf.clear();
+        radiotap::write_tx_header(&mut self.tx_buf, frame.rate, frame.no_ack);
+        self.tx_buf.extend_from_slice(&frame.bytes);
+        match nix::unistd::write(self.fd.get_ref(), &self.tx_buf) {
             Ok(_) => Ok(()),
             Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::ENOBUFS) => Err(frame),
             Err(e) => {
@@ -176,6 +194,27 @@ impl Netif for Tap {
                     ));
                 }
                 Err(_would_block) => {}
+            }
+        }
+    }
+
+    fn try_recv(&mut self) -> io::Result<Option<Ipv6Packet>> {
+        loop {
+            match self.fd.try_io(Interest::READABLE, |fd| {
+                Ok(nix::unistd::read(fd, &mut self.buf)?)
+            }) {
+                Ok(n) => {
+                    if let Some(packet) = Ipv6Packet::from_ethernet(&self.buf[..n]) {
+                        return Ok(Some(packet));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("{} failed: {e}", self.name),
+                    ));
+                }
             }
         }
     }

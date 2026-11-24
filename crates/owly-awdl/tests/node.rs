@@ -545,3 +545,51 @@ fn block_ack_sessions_are_accepted_only_when_asked_to() {
         assert_eq!(answered, accept);
     }
 }
+
+#[test]
+fn amsdu_never_reorders_packets_for_the_same_peer() {
+    let radio = RadioConstraints {
+        channel: Channel(149),
+        presence: Presence::Fixed,
+    };
+    let mut cfg = Config::new(US, "owly", radio);
+    cfg.amsdu = true;
+    cfg.max_frame = 2304;
+    let mut n = Node::new(cfg, START);
+    let mut t = meet(&mut n, &seq(PHONE_SEQ));
+    // Advance into a shared slot (slot 0 is on 149), clear of the start guard.
+    while !n.may_send(PHONE, t) {
+        t = t.plus(256);
+    }
+    let pkt = |seq_num: u16, len: usize| {
+        Ipv6Packet::echo_request(US, PHONE, 0x1234, seq_num, &vec![0xaa; len])
+    };
+    // Packet 0 (1000 B) + packet 1 (1400 B) exceeds max_frame (2304), so
+    // packet 1 cannot join packet 0. Packet 2 (100 B) WOULD fit beside
+    // packet 0, but must NOT overtake packet 1; instead it joins packet 1.
+    let actions: Vec<Action> = n
+        .handle_outbound(t, [pkt(0, 1000), pkt(1, 1400), pkt(2, 100)])
+        .collect();
+    let mut delivered_seqs = Vec::new();
+    let mut frame_sizes = Vec::new();
+    for f in transmits(&actions) {
+        if f.to != PHONE {
+            continue;
+        }
+        let Ok(frame::Received::Data {
+            header,
+            amsdu,
+            body,
+        }) = frame::parse(&f.bytes)
+        else {
+            continue;
+        };
+        let msdus = frame::msdus(&header, amsdu, body).unwrap();
+        frame_sizes.push(msdus.len());
+        for m in msdus {
+            delivered_seqs.push(u16::from_be_bytes([m.payload[46], m.payload[47]]));
+        }
+    }
+    assert_eq!(delivered_seqs, [0, 1, 2], "TCP order preserved");
+    assert_eq!(frame_sizes, [1, 2], "p0 alone, then p1+p2 coalesced");
+}

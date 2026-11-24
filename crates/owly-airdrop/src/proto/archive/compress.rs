@@ -384,7 +384,7 @@ pub struct Encoder {
 
 enum EncoderKind {
     Gzip(flate2::write::GzEncoder<Vec<u8>>),
-    DvZip { piece: Vec<u8>, level: Compression },
+    DvZip { piece: Vec<u8>, compress: Compress },
 }
 
 impl Encoder {
@@ -393,7 +393,7 @@ impl Encoder {
             Compressor::Gzip => EncoderKind::Gzip(flate2::write::GzEncoder::new(Vec::new(), level)),
             Compressor::DvZip => EncoderKind::DvZip {
                 piece: Vec::with_capacity(DVZIP_PIECE),
-                level,
+                compress: Compress::new(level, true),
             },
         };
         Encoder { kind }
@@ -405,14 +405,14 @@ impl Encoder {
                 gz.write_all(data).expect("writing to a Vec can't fail");
                 std::mem::take(gz.get_mut())
             }
-            EncoderKind::DvZip { piece, level } => {
+            EncoderKind::DvZip { piece, compress } => {
                 let mut out = Vec::new();
                 while !data.is_empty() {
                     let n = data.len().min(DVZIP_PIECE - piece.len());
                     piece.extend_from_slice(&data[..n]);
                     data = &data[n..];
                     if piece.len() == DVZIP_PIECE {
-                        out.extend(dvzip_chunk(piece, *level));
+                        dvzip_chunk_into(piece, compress, &mut out);
                         piece.clear();
                     }
                 }
@@ -424,30 +424,54 @@ impl Encoder {
     pub fn finish(self) -> Vec<u8> {
         match self.kind {
             EncoderKind::Gzip(gz) => gz.finish().expect("writing to a Vec can't fail"),
-            EncoderKind::DvZip { piece, level } if !piece.is_empty() => dvzip_chunk(&piece, level),
+            EncoderKind::DvZip {
+                piece,
+                mut compress,
+            } if !piece.is_empty() => {
+                let mut out = Vec::new();
+                dvzip_chunk_into(&piece, &mut compress, &mut out);
+                out
+            }
             EncoderKind::DvZip { .. } => Vec::new(),
         }
     }
 }
 
-/// One DVZip chunk: a length, then `piece` as its own zlib stream (DVZ-2).
+/// One DVZip chunk: a 4-byte length, then `piece` as its own zlib stream, or
+/// stored uncompressed when zlib doesn't shrink it (DVZ-1, DVZ-2, DVZ-4).
 pub fn dvzip_chunk(piece: &[u8], level: Compression) -> Vec<u8> {
-    let mut z = Compress::new(level, true);
-    let mut out = vec![0; 4];
+    let mut compress = Compress::new(level, true);
+    let mut out = Vec::new();
+    dvzip_chunk_into(piece, &mut compress, &mut out);
+    out
+}
+
+fn dvzip_chunk_into(piece: &[u8], compress: &mut Compress, out: &mut Vec<u8>) {
+    compress.reset();
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
     out.reserve(piece.len() + 64);
     loop {
-        let before = z.total_in() as usize;
-        let status = z
-            .compress_vec(&piece[before..], &mut out, FlushCompress::Finish)
+        let before = compress.total_in() as usize;
+        let status = compress
+            .compress_vec(&piece[before..], out, FlushCompress::Finish)
             .expect("compressing into a Vec can't fail");
         if status == Status::StreamEnd {
             break;
         }
         out.reserve(out.capacity().max(64));
     }
-    let len = (out.len() - 4) as u32;
-    out[..4].copy_from_slice(&len.to_be_bytes());
-    out
+    let compressed_len = out.len() - start - 4;
+    if !piece.is_empty() && compressed_len >= piece.len() {
+        // DVZ-1: store pieces zlib doesn't shrink (photos, videos, archives).
+        out.truncate(start + 4);
+        let len = piece.len() as u32 | STORED;
+        out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(piece);
+    } else {
+        let len = compressed_len as u32;
+        out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -531,11 +555,50 @@ pub(crate) mod tests {
     pub(crate) fn chunk_count(mut stream: &[u8]) -> usize {
         let mut n = 0;
         while !stream.is_empty() {
-            let len = u32::from_be_bytes(stream[..4].try_into().unwrap()) as usize;
+            let len = (u32::from_be_bytes(stream[..4].try_into().unwrap()) & !STORED) as usize;
             stream = &stream[4 + len..];
             n += 1;
         }
         n
+    }
+
+    // spec: DVZ-1, DVZ-4
+    #[test]
+    fn dvzip_stores_incompressible_pieces_and_switches_modes() {
+        let incompressible: Vec<u8> = (0..DVZIP_PIECE as u32)
+            .map(|i| {
+                let x = i.wrapping_mul(2_654_435_761);
+                (x ^ (x >> 13) ^ (x >> 21)) as u8
+            })
+            .collect();
+        let compressible = vec![b'a'; DVZIP_PIECE];
+
+        let mut input = Vec::with_capacity(DVZIP_PIECE * 3);
+        input.extend_from_slice(&compressible);
+        input.extend_from_slice(&incompressible);
+        input.extend_from_slice(&compressible);
+
+        let mut enc = Encoder::new(Compressor::DvZip, Compression::fast());
+        let mut stream = enc.write(&input);
+        stream.extend(enc.finish());
+
+        // Inspect each chunk's header: compressed, stored, compressed.
+        let mut flags = Vec::new();
+        let mut rest = stream.as_slice();
+        while !rest.is_empty() {
+            let raw = u32::from_be_bytes(rest[..4].try_into().unwrap());
+            let stored = raw & STORED != 0;
+            let len = (raw & !STORED) as usize;
+            if stored {
+                assert_eq!(len, DVZIP_PIECE);
+            } else {
+                assert!(len < DVZIP_PIECE);
+            }
+            flags.push(stored);
+            rest = &rest[4 + len..];
+        }
+        assert_eq!(flags, [false, true, false]);
+        assert_eq!(decode_all(Compressor::DvZip, &stream).unwrap(), input);
     }
 
     /// A stored chunk (DVZ-1).
@@ -590,7 +653,11 @@ pub(crate) mod tests {
     // spec: DVZ-3, DVZ-4
     #[test]
     fn dvzip_rejects_bad_chunks() {
-        let good = dvzip_chunk(b"hello", Compression::default());
+        let good = dvzip_chunk(b"hello hello hello hello hello", Compression::default());
+        assert_eq!(
+            u32::from_be_bytes(good[..4].try_into().unwrap()) & STORED,
+            0
+        );
 
         // A length running past the end of the body.
         let mut long = good.clone();

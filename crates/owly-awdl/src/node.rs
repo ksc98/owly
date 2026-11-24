@@ -289,6 +289,23 @@ impl Node {
         out.into_iter()
     }
 
+    /// Takes a batch of outbound IPv6 packets at `now` and services the
+    /// queues once, so back-to-back packets can coalesce into A-MSDUs when a
+    /// slot is open.
+    pub fn handle_outbound<I: IntoIterator<Item = Ipv6Packet>>(
+        &mut self,
+        now: Time,
+        packets: I,
+    ) -> impl Iterator<Item = Action> + use<I> {
+        let mut out = Vec::new();
+        for packet in packets {
+            self.enqueue(now, packet, &mut out);
+        }
+        self.service(now, &mut out);
+        out.push(Action::ArmTimer(self.deadline(now)));
+        out.into_iter()
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -826,14 +843,21 @@ impl Node {
                     .min(self.cfg.max_frame.saturating_sub(frame::HEADER_LEN + 2));
                 let mut len = frame::amsdu_subframe_len(batch[0].packet.data.len());
                 let mut rest = VecDeque::new();
+                let mut full = false;
                 while let Some(next) = items.pop_front() {
-                    let add = frame::amsdu_subframe_len(next.packet.data.len()) + 3;
-                    if next.packet.dst == dst && batch.len() < AMSDU_PACKETS && len + add <= limit {
-                        len += add;
-                        batch.push(next);
-                    } else {
-                        rest.push_back(next);
+                    if !full && next.packet.dst == dst {
+                        let pad = (4 - len % 4) % 4;
+                        let add = pad + frame::amsdu_subframe_len(next.packet.data.len());
+                        if batch.len() < AMSDU_PACKETS && len + add <= limit {
+                            len += add;
+                            batch.push(next);
+                            continue;
+                        }
+                        // Never pull a later packet for the same peer ahead of
+                        // one that didn't fit, or TCP sees reordering.
+                        full = true;
                     }
+                    rest.push_back(next);
                 }
                 items = rest;
             }

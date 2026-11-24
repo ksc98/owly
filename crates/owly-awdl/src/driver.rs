@@ -61,12 +61,21 @@ pub trait Air {
     fn send(&mut self, frame: Frame) -> Result<(), Frame>;
 }
 
+/// The most outbound packets drained per wakeup, so back-to-back packets can
+/// coalesce into A-MSDUs without starving timers or RX.
+const OUTBOUND_BATCH: usize = 16;
+
 /// The host's end of the link: the network interface its IPv6 sockets use
 /// (a TAP device on Linux, a Wintun adapter on Windows).
 pub trait Netif {
     /// The next IPv6 packet the host sends on the link. Dropping the future
     /// loses no packet, as with [`Air::recv`].
     fn recv(&mut self) -> impl Future<Output = io::Result<Ipv6Packet>>;
+
+    /// Takes another queued outbound packet without waiting, if one is ready.
+    fn try_recv(&mut self) -> io::Result<Option<Ipv6Packet>> {
+        Ok(None)
+    }
 
     /// Hands the host a packet from a peer. One it can't take now is
     /// dropped, as a full queue would drop it.
@@ -232,6 +241,15 @@ impl<A: Air, N: Netif> Driver<A, N> {
 
     fn handle(&mut self, input: Input) {
         let actions: Vec<Action> = self.node.handle(input).collect();
+        self.apply(actions);
+    }
+
+    fn handle_outbound(&mut self, now: Time, packets: Vec<Ipv6Packet>) {
+        let actions: Vec<Action> = self.node.handle_outbound(now, packets).collect();
+        self.apply(actions);
+    }
+
+    fn apply(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
                 Action::Transmit { at, frame } => self.transmit(at, frame),
@@ -371,12 +389,17 @@ impl<A: Air, N: Netif> Driver<A, N> {
         Some(self.instant(now.plus(wait.max(1))))
     }
 
+    /// Remaining room in the unicast queues before the host should hold off.
+    fn outbound_room(&self) -> usize {
+        UNICAST_QUEUE.saturating_sub(self.node.backlog() + self.unicast.len())
+    }
+
     /// Whether to read the host's next packet. Not while as many as the
     /// node queues wait already, as legacy stopped reading `awdl0` while it
     /// held a frame: the host's queue holds them meanwhile, and drops the newest
     /// when full rather than the node dropping its oldest.
     fn takes_outbound(&self) -> bool {
-        self.node.backlog() + self.unicast.len() < UNICAST_QUEUE
+        self.outbound_room() > 0
     }
 
     fn publish_peers(&self) {
@@ -436,20 +459,8 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
         tokio::select! {
             biased;
             _ = d.stopped.changed() => return Ok(()),
-            r = d.air.recv() => match r {
-                Ok(rx) => {
-                    let now = d.now();
-                    d.handle(Input::Frame { rx_time: now, rssi: rx.rssi, bytes: &rx.bytes });
-                }
-                Err(e) => return Err(e.to_string()),
-            },
-            r = d.netif.recv(), if d.takes_outbound() => match r {
-                Ok(packet) => {
-                    let now = d.now();
-                    d.handle(Input::Outbound { now, packet });
-                }
-                Err(e) => return Err(e.to_string()),
-            },
+            // Overdue sync/slot timers run ahead of ready sockets so traffic
+            // bursts never starve PSFs, MIFs or slot wakeups.
             _ = tokio::time::sleep_until(wake) => {
                 let now = d.now();
                 if now >= d.timer {
@@ -461,6 +472,30 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
                     d.handle(Input::Timer(now));
                 }
             }
+            r = d.air.recv() => match r {
+                Ok(rx) => {
+                    let now = d.now();
+                    d.handle(Input::Frame { rx_time: now, rssi: rx.rssi, bytes: &rx.bytes });
+                }
+                Err(e) => return Err(e.to_string()),
+            },
+            r = d.netif.recv(), if d.takes_outbound() => match r {
+                Ok(packet) => {
+                    let now = d.now();
+                    let limit = d.outbound_room().min(OUTBOUND_BATCH);
+                    let mut batch = Vec::with_capacity(limit);
+                    batch.push(packet);
+                    while batch.len() < limit {
+                        match d.netif.try_recv() {
+                            Ok(Some(p)) => batch.push(p),
+                            Ok(None) => break,
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    d.handle_outbound(now, batch);
+                }
+                Err(e) => return Err(e.to_string()),
+            },
             _ = stats.tick() => d.log_stats(),
             _ = peers.tick() => d.publish_peers(),
         }

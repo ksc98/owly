@@ -66,6 +66,16 @@ impl Netif for MemNetif {
         Ok(p)
     }
 
+    fn try_recv(&mut self) -> io::Result<Option<Ipv6Packet>> {
+        match self.outbound.try_recv() {
+            Ok(p) => {
+                self.read.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(p))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     fn deliver(&mut self, packet: Ipv6Packet) {
         let _ = self.delivered.send(packet);
     }
@@ -332,6 +342,34 @@ async fn the_host_is_not_read_while_the_queue_is_full() {
     a.full.store(false, Ordering::Relaxed);
     let got = received(&mut b, 1000, Duration::from_secs(5)).await;
     assert_eq!(got, (0..1000).collect::<Vec<_>>());
+    a.running.stop();
+    b.running.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_bursts_coalesce_into_amsdus_in_order() {
+    let (a_tx, b_rx) = mpsc::unbounded_channel();
+    let (b_tx, a_rx) = mpsc::unbounded_channel();
+    let mut cfg = config(1);
+    cfg.amsdu = true;
+    let mut a = host_with(cfg, a_tx, a_rx);
+    let mut b = host(2, b_tx, b_rx);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        a.peers.wait_for(|p| p.len() == 1).await.unwrap();
+        b.peers.wait_for(|p| p.len() == 1).await.unwrap();
+    })
+    .await
+    .expect("the two met");
+
+    let before = a.sent.load(Ordering::Relaxed);
+    send_many(&a, 40);
+    let got = received(&mut b, 40, Duration::from_secs(3)).await;
+    let frames = a.sent.load(Ordering::Relaxed) - before;
+    assert_eq!(got, (0..40).collect::<Vec<_>>());
+    assert!(
+        frames < 40,
+        "expected A-MSDU coalescing, sent {frames} frames for 40 packets"
+    );
     a.running.stop();
     b.running.stop();
 }

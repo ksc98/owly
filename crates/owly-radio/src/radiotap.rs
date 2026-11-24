@@ -34,6 +34,18 @@ const FIELDS: [(usize, usize); 5] = [(8, 8), (1, 1), (1, 1), (2, 4), (1, 2)];
 /// Reads a captured frame's radiotap header. `None` for a frame that's
 /// malformed or failed its FCS.
 pub fn parse(buf: &[u8]) -> Option<Rx<'_>> {
+    let (mut rx, has_fcs) = parse_header(buf)?;
+    if !has_fcs {
+        rx.frame = strip_unflagged_fcs(rx.frame);
+    }
+    Some(rx)
+}
+
+/// Reads a captured frame's radiotap header without searching for an
+/// unflagged FCS. The bool is true when radiotap's FCS flag was set and the
+/// 4-byte FCS has already been stripped; otherwise callers can discard
+/// unrelated frames before calling [`strip_unflagged_fcs`].
+pub fn parse_header(buf: &[u8]) -> Option<(Rx<'_>, bool)> {
     if buf.len() < 8 || buf[0] != 0 {
         return None;
     }
@@ -73,11 +85,22 @@ pub fn parse(buf: &[u8]) -> Option<Rx<'_>> {
     if flags & F_BADFCS != 0 {
         return None;
     }
+    let has_fcs = flags & F_FCS != 0;
     let mut frame = &buf[len..];
-    if flags & F_FCS != 0 || ends_in_fcs(frame) {
+    if has_fcs {
         frame = frame.get(..frame.len().checked_sub(4)?)?;
     }
-    Some(Rx { frame, rssi, freq })
+    Some((Rx { frame, rssi, freq }, has_fcs))
+}
+
+/// Strips a trailing 4-byte CRC-32 FCS when a driver (ath12k) appended it
+/// without setting radiotap's FCS flag.
+pub fn strip_unflagged_fcs(frame: &[u8]) -> &[u8] {
+    if ends_in_fcs(frame) {
+        &frame[..frame.len() - 4]
+    } else {
+        frame
+    }
 }
 
 /// ath12k (WCN7850) appends the FCS without setting radiotap's FCS flag.
@@ -118,38 +141,51 @@ pub fn rx_header(freq: Option<u16>, rssi: Option<i8>) -> Vec<u8> {
     out
 }
 
-/// A radiotap header for injecting a frame at `rate`, without ACK and
+/// Appends a radiotap header for injecting a frame at `rate`, without ACK and
 /// retries when `no_ack`, as legacy wrote it.
-pub fn tx_header(rate: TxRate, no_ack: bool) -> Vec<u8> {
+pub fn write_tx_header(out: &mut Vec<u8>, rate: TxRate, no_ack: bool) {
     let mut present = 0u32;
-    let mut fields = Vec::with_capacity(8);
+    let mut fields = [0u8; 8];
+    let mut n = 0;
     match rate {
         TxRate::Legacy(r) => {
             present |= 1 << RATE;
-            fields.push(r);
+            fields[n] = r;
+            n += 1;
             if no_ack {
                 // TX flags are a u16 at an even offset: the header is 8.
-                fields.push(0);
+                fields[n] = 0;
+                n += 1;
                 present |= 1 << TX_FLAGS;
-                fields.extend_from_slice(&F_TX_NOACK.to_le_bytes());
+                fields[n..n + 2].copy_from_slice(&F_TX_NOACK.to_le_bytes());
+                n += 2;
             }
         }
         TxRate::Ht { mcs, sgi } => {
             if no_ack {
                 present |= 1 << TX_FLAGS;
-                fields.extend_from_slice(&F_TX_NOACK.to_le_bytes());
+                fields[n..n + 2].copy_from_slice(&F_TX_NOACK.to_le_bytes());
+                n += 2;
             }
             present |= 1 << MCS;
             // Known: bandwidth, MCS, guard interval. 20 MHz.
-            fields.extend_from_slice(&[0x07, if sgi { 0x04 } else { 0 }, mcs]);
+            fields[n..n + 3].copy_from_slice(&[0x07, if sgi { 0x04 } else { 0 }, mcs]);
+            n += 3;
         }
     }
-    let len = 8 + fields.len();
-    let mut out = Vec::with_capacity(len);
+    let len = 8 + n;
+    out.reserve(len);
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&(len as u16).to_le_bytes());
     out.extend_from_slice(&present.to_le_bytes());
-    out.extend_from_slice(&fields);
+    out.extend_from_slice(&fields[..n]);
+}
+
+/// A radiotap header for injecting a frame at `rate`, without ACK and
+/// retries when `no_ack`, as legacy wrote it.
+pub fn tx_header(rate: TxRate, no_ack: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    write_tx_header(&mut out, rate, no_ack);
     out
 }
 
