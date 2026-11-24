@@ -908,6 +908,10 @@ async fn exclusive_mode_runs_a_hidden_ap_without_ad_hoc_mode() {
         "hw_mode=a",
         "beacon_int=1000",
         "wpa=2",
+        // 80 MHz, as the opclass-128 channel AWDL announces.
+        "ieee80211ac=1",
+        "vht_oper_chwidth=1",
+        "vht_oper_centr_freq_seg0_idx=155",
     ] {
         assert!(conf.lines().any(|l| l == line), "{line} in {conf}");
     }

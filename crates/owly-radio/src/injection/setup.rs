@@ -521,15 +521,21 @@ fn cell_mac(ops: &dyn Ops, iface: &str, mac: MacAddr) {
 
 /// A hidden, WPA2-protected AP with a random name and passphrase, so
 /// nothing ever joins it: it's there for its MAC to ACK the phone.
+///
+/// On 5 GHz it's 80 MHz wide, primary on the social channel. AWDL
+/// announces the channel as operating class 128 (AWDL-10), an 80 MHz
+/// channel, and a phone sends us 80 MHz frames there, which a radio held
+/// to 20 MHz by a 20 MHz AP never decodes.
 fn write_hostapd_conf(path: &Path, channel: u8) -> std::io::Result<()> {
     use std::io::Write;
     let mut random = [0u8; 20];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut random)?;
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let conf = format!(
-        "interface={AP}\ndriver=nl80211\nssid=owly-{}\nignore_broadcast_ssid=1\nhw_mode={}\nchannel={channel}\nieee80211n=1\nbeacon_int=1000\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\n",
+        "interface={AP}\ndriver=nl80211\nssid=owly-{}\nignore_broadcast_ssid=1\nhw_mode={}\nchannel={channel}\nieee80211n=1\n{}beacon_int=1000\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\n",
         hex(&random[..4]),
         if channel == 6 { "g" } else { "a" },
+        vht80_conf(channel),
         hex(&random[4..]),
     );
     let mut f = std::fs::OpenOptions::new()
@@ -539,6 +545,19 @@ fn write_hostapd_conf(path: &Path, channel: u8) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     f.write_all(conf.as_bytes())
+}
+
+/// hostapd's lines for an 80 MHz AP with `channel` as its primary: 149 in
+/// 149-161 (centre 155), 44 in 36-48 (centre 42). Nothing on 2.4 GHz.
+fn vht80_conf(channel: u8) -> String {
+    let (ht40, centre) = match channel {
+        149 => ("HT40+", 155),
+        44 => ("HT40+", 42),
+        _ => return String::new(),
+    };
+    format!(
+        "ht_capab=[{ht40}]\nieee80211ac=1\nvht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx={centre}\n"
+    )
 }
 
 /// hostapd in the foreground, in a process group of its own, logging to
