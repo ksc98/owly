@@ -596,7 +596,7 @@ For the wrapped regular-file form in ASK-5, the archive MAY include a `./<folder
 
 **UP-9** The `TransferID` header MUST equal `TransferID.id` from the `/Ask`. A receiver SHOULD reject an upload whose `TransferID` header doesn't match. It MUST accept an upload with no `TransferID` header when the `/Ask` used the legacy form.
 
-**UP-10** `TotalBytes` is the sum of the files' `FileSize`, or `0`. A receiver MUST NOT rely on it.
+**UP-10** `TotalBytes` is the sum of the files' `FileSize`, or `0`. A receiver MUST NOT rely on it. (sender) A sender SHOULD send the sum: an iPhone draws its progress against it, and given `0` fills most of the way at once and then barely moves.
 
 **UP-11** (receiver) An upload is complete when the archive's `TRAILER!!!` entry has been read, whether or not the rest of the body, such as a chunked body's terminating zero-length chunk, has arrived. A receiver MUST then respond as UP-5 says rather than wait for the body to end.
 

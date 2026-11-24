@@ -132,14 +132,18 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
     plist_request(Path::Ask, &request.to_plist())
 }
 
-/// The `/Upload` head for a body of `len` bytes (UP-1a, UP-9, UP-10).
-pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64) -> Vec<u8> {
+/// The `/Upload` head for a body of `len` bytes, of files totalling
+/// `total` bytes uncompressed (UP-1a, UP-9, UP-10). An iPhone draws its
+/// progress against `TotalBytes`: given 0, it fills most of the way at once
+/// and then barely moves, so a transfer looks stuck however fast it goes.
+pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64, total: u64) -> Vec<u8> {
     let len = len.to_string();
+    let total = total.to_string();
     head(
         Path::Upload,
         &[
             ("TransferID", transfer_id),
-            ("TotalBytes", "0"),
+            ("TotalBytes", &total),
             ("Content-Type", compressor.content_type()),
             ("Connection", "keep-alive"),
             ("Content-Length", &len),
@@ -322,6 +326,8 @@ pub struct Transfer {
     transfer_id: String,
     is_url: bool,
     upload: Option<(Compressor, u64)>,
+    /// The offered files' sizes summed, for `TotalBytes` (UP-10).
+    total_bytes: u64,
     reader: ResponseReader,
     actions: VecDeque<Action>,
 }
@@ -336,6 +342,10 @@ impl Transfer {
         upload: Option<(Compressor, u64)>,
     ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
+        let total_bytes = match offer {
+            Offer::Files(files) => files.iter().filter_map(|f| f.size).sum(),
+            Offer::Urls(_) => 0,
+        };
         let actions = VecDeque::from([
             Action::Transmit(ask_request(config, transfer_id, offer)),
             Action::SetTimer(Some(config.ask_timeout)),
@@ -345,6 +355,7 @@ impl Transfer {
             transfer_id: transfer_id.into(),
             is_url,
             upload,
+            total_bytes,
             reader: ResponseReader::new(),
             actions,
         }
@@ -426,6 +437,7 @@ impl Transfer {
                         &self.transfer_id,
                         compressor,
                         len,
+                        self.total_bytes,
                     )));
                 }
             }
@@ -481,7 +493,7 @@ mod tests {
         for request in [
             discover_request(),
             ask_request(&config, "ID", &file_offer()),
-            upload_head("ID", Compressor::Gzip, 0),
+            upload_head("ID", Compressor::Gzip, 0, 0),
         ] {
             let (head, _) = http::parse_request(&request, &http::Limits::default())
                 .unwrap()
@@ -509,6 +521,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.headers.get("TransferID"), Some("ID"));
+        // The offered file's size, not the compressed body's (UP-10).
+        assert_eq!(head.headers.get("TotalBytes"), Some("5"));
         assert_eq!(head.body, BodyKind::Length(10));
         t.upload_sent();
         t.receive(&response(200, b""));
