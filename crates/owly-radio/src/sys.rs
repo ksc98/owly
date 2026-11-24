@@ -63,6 +63,9 @@ pub trait Ops: Send + Sync {
     fn sysctl(&self, key: &str, value: &str) -> io::Result<()>;
     /// mt76's debugfs directory for this wiphy.
     fn mt76_dir(&self, phy: &str) -> PathBuf;
+    /// The wiphy's rfkill switch in sysfs (with `soft` and `hard`), if it
+    /// has one.
+    fn rfkill_dir(&self, phy: &str) -> Option<PathBuf>;
     fn read(&self, path: &Path) -> Option<String>;
     fn write(&self, path: &Path, value: &str) -> io::Result<()>;
 
@@ -279,6 +282,14 @@ impl Ops for System {
             let _ = self.run("mount", &["-t", "debugfs", "none", "/sys/kernel/debug"]);
         }
         debug.join("ieee80211").join(phy).join("mt76")
+    }
+
+    fn rfkill_dir(&self, phy: &str) -> Option<PathBuf> {
+        let dir = Path::new("/sys/class/ieee80211").join(phy);
+        fs::read_dir(&dir).ok()?.flatten().find_map(|e| {
+            let name = e.file_name();
+            name.to_str()?.starts_with("rfkill").then(|| dir.join(name))
+        })
     }
 
     fn read(&self, path: &Path) -> Option<String> {

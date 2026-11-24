@@ -144,6 +144,7 @@ impl Setup<'_> {
         if self.settings.country.is_none() && self.station.tx_channels(self.settings).is_empty() {
             return Err(no_channels());
         }
+        self.unblock()?;
         // Without one in radio.toml, the country the kernel has from the AP:
         // it forgets it once the station is down, and the world's domain
         // left in its place allows no cell on 5 GHz.
@@ -278,6 +279,29 @@ impl Setup<'_> {
 
     /// mt76's runtime power management off for the session, where the
     /// quirks ask.
+    /// Switches Wi-Fi on for the session if it's switched off in software
+    /// (`nmcli radio wifi off`, `rfkill block`): exclusive mode takes the
+    /// card over anyway, and with it blocked hostapd starts no AP. It's
+    /// switched off again when the radio is given back.
+    fn unblock(&mut self) -> Result<(), Error> {
+        let ops = self.ops;
+        let Some(dir) = ops.rfkill_dir(&self.station.phy) else {
+            return Ok(());
+        };
+        if ops.read(&dir.join("hard")).as_deref() == Some("1") {
+            return Err(Error::no_radio(crate::probe::HARD_BLOCKED));
+        }
+        if ops.read(&dir.join("soft")).as_deref() != Some("1") {
+            return Ok(());
+        }
+        self.record(Step::Rfkill { dir: dir.clone() })?;
+        ops.write(&dir.join("soft"), "0").map_err(|e| {
+            Error::no_radio(format!(
+                "Wi-Fi is switched off, and Owly couldn't switch it on: {e}"
+            ))
+        })
+    }
+
     fn mt76(&mut self) -> Result<(), Error> {
         if !self.station.quirk.mt76_pm_off {
             return Ok(());

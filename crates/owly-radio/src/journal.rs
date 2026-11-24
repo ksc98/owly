@@ -55,6 +55,9 @@ pub enum Step {
     },
     /// The regulatory domain before the session asked for another.
     Regdom { alpha2: String },
+    /// Wi-Fi was switched off (a soft rfkill block) before the session
+    /// switched it on: switch it off again.
+    Rfkill { dir: PathBuf },
 }
 
 /// The journal, locked for as long as this value lives.
@@ -220,6 +223,11 @@ fn undo(ops: &dyn Ops, step: &Step, state: &mut Undo) -> Result<(), String> {
         } => {
             let _ = ops.write(&dir.join("runtime-pm"), runtime_pm);
             let _ = ops.write(&dir.join("deep-sleep"), deep_sleep);
+        }
+        Step::Rfkill { dir } => {
+            if let Err(e) = ops.write(&dir.join("soft"), "1") {
+                tracing::warn!("switching Wi-Fi off again ({}): {e}", dir.display());
+            }
         }
         Step::Regdom { alpha2 } => {
             if let Err(e) = ops.set_regdom(alpha2) {

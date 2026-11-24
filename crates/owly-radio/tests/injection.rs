@@ -316,9 +316,20 @@ impl Ops for FakeOps {
     fn mt76_dir(&self, phy: &str) -> PathBuf {
         PathBuf::from(format!("/debug/{phy}/mt76"))
     }
+    fn rfkill_dir(&self, phy: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(format!("/rfkill/{phy}")))
+    }
     fn read(&self, path: &Path) -> Option<String> {
         if path.starts_with("/debug") {
             return Some("1".into());
+        }
+        if let Ok(switch) = path.strip_prefix("/rfkill/phy0") {
+            // `rfkill.soft` or `rfkill.hard` in the test's directory blocks it.
+            let blocked = self
+                .dir
+                .join(format!("rfkill.{}", switch.display()))
+                .exists();
+            return Some(if blocked { "1" } else { "0" }.into());
         }
         if path.ends_with("disable_ipv6") {
             return Some("0".into());
@@ -884,6 +895,57 @@ async fn a_card_that_refuses_a_cell_beside_its_station_becomes_the_cell() {
     ];
     assert_eq!(after[after.len() - tail.len()..], tail);
     assert_eq!(fx.ops.kind(STATION).as_deref(), Some("managed"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exclusive_mode_switches_wifi_on_for_the_session() {
+    let fx = Fx::with(|o| {
+        o.driver = "rtw89_8852bu".into();
+        o.wiphy
+            .lock()
+            .unwrap()
+            .iftypes
+            .retain(|t| *t != IfType::Adhoc);
+    });
+    std::fs::write(fx.dir.path().join("rfkill.soft"), "").unwrap();
+    let mut settings = fx.settings();
+    settings.allow_untested = true;
+    let mut backend = fx.backend_with(settings);
+    backend.up().await.unwrap();
+    let calls = fx.ops.calls();
+    assert!(
+        calls.contains(&"write /rfkill/phy0/soft 0".into()),
+        "{calls:?}"
+    );
+    assert!(fx.journal().unwrap().contains(&Step::Rfkill {
+        dir: "/rfkill/phy0".into()
+    }));
+    let n = calls.len();
+    backend.down().await.unwrap();
+    // Switched off again last, once the station is given back.
+    assert_eq!(
+        fx.since(n).last().map(String::as_str),
+        Some("write /rfkill/phy0/soft 1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hard_rfkill_block_keeps_the_radio_down() {
+    let fx = Fx::with(|o| {
+        o.driver = "rtw89_8852bu".into();
+        o.wiphy
+            .lock()
+            .unwrap()
+            .iftypes
+            .retain(|t| *t != IfType::Adhoc);
+    });
+    std::fs::write(fx.dir.path().join("rfkill.hard"), "").unwrap();
+    let mut settings = fx.settings();
+    settings.allow_untested = true;
+    let mut backend = fx.backend_with(settings);
+    let e = backend.up().await.unwrap_err();
+    assert!(e.to_string().contains("switched off in hardware"), "{e}");
+    assert!(!fx.awdl_running());
 }
 
 #[tokio::test(flavor = "multi_thread")]

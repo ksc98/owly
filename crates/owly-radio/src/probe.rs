@@ -282,6 +282,15 @@ pub fn capabilities(ops: &dyn Ops, settings: &Settings) -> Capabilities {
             },
         },
         Mode::Exclusive | Mode::ActiveMonitor => {
+            if let Some(dir) = ops.rfkill_dir(&station.phy) {
+                if ops.read(&dir.join("hard")).as_deref() == Some("1") {
+                    caps.missing.push(missing("radio", HARD_BLOCKED));
+                } else if ops.read(&dir.join("soft")).as_deref() == Some("1") {
+                    caps.issues.push(
+                        "Wi-Fi is switched off. Owly switches it on while it holds the radio, and off again after.".into(),
+                    );
+                }
+            }
             let freqs = station.tx_channels(settings);
             caps.channel = freqs.first().and_then(|f| social_channel(*f));
             if caps.channel == Some(6) {
@@ -301,6 +310,10 @@ pub fn capabilities(ops: &dyn Ops, settings: &Settings) -> Capabilities {
     }
     caps
 }
+
+/// Why the radio can't come up with Wi-Fi switched off in hardware.
+pub const HARD_BLOCKED: &str =
+    "Wi-Fi is switched off in hardware (a switch, a key or the firmware). Switch it on first.";
 
 /// What the card lacks for the mode its quirks ask for.
 fn mode_problem(station: &Station, settings: &Settings, card: &Card) -> Option<Missing> {
