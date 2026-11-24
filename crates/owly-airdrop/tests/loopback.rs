@@ -318,7 +318,10 @@ veth_test! {
             .unwrap();
         assert_eq!(outcome, Outcome::Declined);
         let waited = started.elapsed();
-        assert!(waited > Duration::from_secs(15) && waited < Duration::from_secs(30), "{waited:?}");
+        // ASK-2a: longer than a receiver's 15 s, and no longer than our own
+        // timeout, give or take the TLS handshake.
+        let timeout = owly_airdrop::proto::sender::ASK_TIMEOUT;
+        assert!(waited > Duration::from_secs(15) && waited < timeout + Duration::from_secs(5), "{waited:?}");
     }
 }
 
