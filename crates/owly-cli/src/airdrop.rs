@@ -111,6 +111,21 @@ pub struct SendArgs {
 }
 
 impl On {
+    /// The radio, when the interface is owlyd's and isn't up yet.
+    async fn hold(&self, bus: Option<&str>) -> io::Result<Option<crate::radio::Held>> {
+        if self.iface != owly_radio::injection::AWDL_IFACE
+            || std::path::Path::new("/sys/class/net")
+                .join(&self.iface)
+                .exists()
+        {
+            return Ok(None);
+        }
+        crate::radio::Held::take(bus)
+            .await
+            .map(Some)
+            .map_err(io::Error::other)
+    }
+
     fn resolve(&self) -> io::Result<(Interface, String)> {
         // rustls needs a crypto provider chosen; ring is owly-cli's.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -141,7 +156,8 @@ pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, S
 /// `owly browse`: by mDNS and, on an owlyd lease, by `/Discover` at the
 /// radio's AWDL peers (DISC-5), as `owly send` finds them.
 pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, String> {
-    async {
+    let held = args.on.hold(bus).await.map_err(|e| e.to_string())?;
+    let result = async {
         let (iface, name) = args.on.resolve()?;
         let _advert = advertise(args.no_ble).await;
         let sender = Sender::new(sender::Config::new(name, random_service_id()?))?;
@@ -182,12 +198,21 @@ pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, Str
         Ok(ExitCode::SUCCESS)
     }
     .await
-    .map_err(|e: io::Error| e.to_string())
+    .map_err(|e: io::Error| e.to_string());
+    if let Some(held) = held {
+        held.release().await;
+    }
+    result
 }
 
 /// `owly send`.
 pub async fn send(bus: Option<&str>, args: SendArgs) -> Result<ExitCode, String> {
-    send_inner(bus, args).await.map_err(|e| e.to_string())
+    let held = args.on.hold(bus).await.map_err(|e| e.to_string())?;
+    let result = send_inner(bus, args).await.map_err(|e| e.to_string());
+    if let Some(held) = held {
+        held.release().await;
+    }
+    result
 }
 
 async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
