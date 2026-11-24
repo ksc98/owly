@@ -14,8 +14,10 @@ use super::http::{self, BodyDecoder, ResponseHead};
 use super::messages::{AskRequest, DiscoverRequest, DiscoverResponse, Offer};
 use super::plist;
 
-/// ASK-2a: longer than the receiver's 15 s, so a slow user isn't cut off.
-pub const ASK_TIMEOUT: Duration = Duration::from_secs(20);
+/// ASK-2a: about as long as Apple's senders wait. An iPhone keeps its
+/// prompt up until the sender gives up, so this is how long its user has to
+/// tap Accept.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long to wait for the `/Upload` response once the body is sent.
 pub const UPLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
