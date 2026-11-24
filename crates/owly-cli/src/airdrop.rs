@@ -519,7 +519,10 @@ async fn knock_peers(
 }
 
 /// `/Discover` at each of the lease's AWDL peers until `deadline`, handing
-/// each one that answers to `on_listed` once, until it says to stop.
+/// each one that answers to `on_listed` once, until it says to stop. Every
+/// peer is asked at once: each `/Discover` is a TLS handshake across the
+/// air, and asked in turn, a phone waited out every Mac and silent device
+/// ahead of it.
 async fn discover_peers(
     iface: &Interface,
     sender: &Sender,
@@ -527,39 +530,56 @@ async fn discover_peers(
     deadline: tokio::time::Instant,
     mut on_listed: impl FnMut(Listed) -> bool,
 ) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
     let mut tried = std::collections::HashSet::new();
     let mut answered = std::collections::HashSet::new();
-    while tokio::time::Instant::now() < deadline {
+    let mut asking = std::collections::HashSet::new();
+    let mut pending = FuturesUnordered::new();
+    let ask = |mac: MacAddr| {
+        let addr = SocketAddrV6::new(mac.link_local(), AIRDROP_PORT, 0, iface.index);
+        // A peer that refuses fails at once; a silent one is asked again
+        // once this gives up on it.
+        let wait = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_secs(3));
+        async move {
+            let found = tokio::time::timeout(wait, sender.discover(addr)).await;
+            (mac, addr, found)
+        }
+    };
+    loop {
         for mac in lease.peers().await {
-            if answered.contains(&mac) {
+            if answered.contains(&mac) || !asking.insert(mac) {
                 continue;
             }
             if tried.insert(mac) {
                 eprintln!("trying AWDL peer {mac}");
             }
-            let addr = SocketAddrV6::new(mac.link_local(), AIRDROP_PORT, 0, iface.index);
-            // A peer that refuses fails at once; one that's silent mustn't
-            // hold up the others for long.
-            let wait = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .min(Duration::from_secs(3));
-            let Ok(Ok(Some(receiver))) = tokio::time::timeout(wait, sender.discover(addr)).await
-            else {
-                continue;
-            };
-            answered.insert(mac);
-            let listed = Listed {
-                instance: mac.to_string(),
-                name: receiver.computer_name,
-                addr,
-                // UP-1b: no TXT to say, and Apple receivers take DVZip.
-                flags: RECEIVER_FLAGS | SUPPORTS_DVZIP,
-            };
-            if on_listed(listed) {
-                return;
-            }
+            pending.push(ask(mac));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // New peers turn up while others are being asked.
+        let rescan = tokio::time::sleep(Duration::from_millis(500));
+        tokio::select! {
+            Some((mac, addr, found)) = pending.next(), if !pending.is_empty() => {
+                asking.remove(&mac);
+                let Ok(Ok(Some(receiver))) = found else {
+                    continue;
+                };
+                answered.insert(mac);
+                let listed = Listed {
+                    instance: mac.to_string(),
+                    name: receiver.computer_name,
+                    addr,
+                    // UP-1b: no TXT to say, and Apple receivers take DVZip.
+                    flags: RECEIVER_FLAGS | SUPPORTS_DVZIP,
+                };
+                if on_listed(listed) {
+                    return;
+                }
+            }
+            () = rescan => {}
+            () = tokio::time::sleep_until(deadline) => return,
+        }
     }
 }
 
