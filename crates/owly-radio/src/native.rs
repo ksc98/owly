@@ -6,8 +6,9 @@
 //! a TAP device carrying Ethernet frames, created down, given the AWDL
 //! address as its MAC (AWDL-2) and its EUI-64 link-local address without
 //! DAD (NET-1), MTU 1450 with offloads off, then brought up. Each peer that
-//! turns valid gets a permanent neighbour entry (NET-2). The monitor asks
-//! for MTU 8192 so A-MSDUs fit.
+//! turns valid gets a permanent neighbour entry (NET-2), and, beside a
+//! hidden AP, a station entry on it. The monitor asks for MTU 8192 so
+//! A-MSDUs fit.
 
 use std::ffi::CString;
 use std::io;
@@ -20,6 +21,7 @@ use owly_awdl::{Config, Ipv6Packet};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
+use crate::nl80211::Nl80211;
 use crate::radiotap;
 use crate::rtnl::Rtnl;
 
@@ -39,10 +41,12 @@ pub struct Native {
 
 impl Native {
     /// Makes `tap` and starts a node with `cfg` on `monitor`, publishing
-    /// its valid peers on `peers`.
+    /// its valid peers on `peers`. With `ap`, the hidden AP the monitor
+    /// sends beside, each valid peer is a station on it.
     pub fn start(
         monitor: &str,
         tap: &str,
+        ap: Option<&str>,
         cfg: Config,
         peers: watch::Sender<Vec<PeerInfo>>,
     ) -> io::Result<Native> {
@@ -70,6 +74,13 @@ impl Native {
         rtnl.add_link_local_nodad(index, mac.link_local())?;
         rtnl.set_up(index, true)?;
 
+        let stations = match ap {
+            Some(ap) => Some(Stations {
+                nl: Nl80211::open()?,
+                ap: if_index(ap)?,
+            }),
+            None => None,
+        };
         let name = tap.to_string();
         let running = driver::spawn(
             cfg,
@@ -83,6 +94,7 @@ impl Native {
                     name,
                     index,
                     rtnl,
+                    stations,
                     buf: vec![0; 16 * 1024],
                 };
                 Ok((monitor, tap))
@@ -155,7 +167,19 @@ struct Tap {
     name: String,
     index: u32,
     rtnl: Rtnl,
+    stations: Option<Stations>,
     buf: Vec<u8>,
+}
+
+/// The hidden AP's station entries, one for each valid peer. mac80211
+/// sends a frame injected from the AP's address out of the AP, to the
+/// station entry for its destination where there is one, and the firmware
+/// sends frames to a station from its fast path, with its own rate
+/// control: an MT7922 held each frame to an address it had no entry for
+/// 5-14 ms, and with entries 6 MB went to an iPhone in 5 s instead of 100.
+struct Stations {
+    nl: Nl80211,
+    ap: u32,
 }
 
 impl Netif for Tap {
@@ -193,10 +217,21 @@ impl Netif for Tap {
         if let Err(e) = self.rtnl.add_neighbour(self.index, mac.link_local(), mac) {
             tracing::warn!("no neighbour entry for {mac}: {e}");
         }
+        if let Some(s) = &mut self.stations {
+            // Whatever an earlier session left first; one AID will do, as
+            // nothing reads it.
+            let _ = s.nl.del_station(s.ap, mac);
+            if let Err(e) = s.nl.new_station(s.ap, mac, 1) {
+                tracing::warn!("no station entry for {mac}, so frames to it go slowly: {e}");
+            }
+        }
     }
 
     fn peer_down(&mut self, mac: MacAddr) {
         let _ = self.rtnl.del_neighbour(self.index, mac.link_local());
+        if let Some(s) = &mut self.stations {
+            let _ = s.nl.del_station(s.ap, mac);
+        }
     }
 }
 

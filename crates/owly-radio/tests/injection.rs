@@ -446,10 +446,12 @@ impl Fx {
     fn backend_with(&self, settings: Settings) -> Injection {
         let dir = self.dir.path().to_path_buf();
         let started = self.awdl.clone();
-        let start: StartAwdl = Arc::new(move |monitor, tap, cfg, peers| {
+        let start: StartAwdl = Arc::new(move |monitor, tap, ap, cfg, peers| {
             assert_eq!((monitor, tap), (MONITOR, "awdl0"));
             *started.lock().unwrap() = Some((cfg, true));
             std::fs::write(dir.join("awdl0"), "").unwrap();
+            // The interface peers become stations on, if any.
+            std::fs::write(dir.join("awdl0.ap"), ap.unwrap_or("")).unwrap();
             let phone = PeerInfo {
                 mac: PHONE.parse().unwrap(),
                 name: "iPhone".into(),
@@ -918,6 +920,12 @@ async fn exclusive_mode_runs_a_hidden_ap_without_ad_hoc_mode() {
     let calls = fx.ops.calls();
     assert!(calls.contains(&format!("add phy0 {AP} AP")));
     assert!(calls.contains(&format!("mac {AP} {STATION_MAC}")));
+    // Peers are stations on the AP, so frames to them take the firmware's
+    // fast path.
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("awdl0.ap")).unwrap(),
+        AP
+    );
     let hostapd = fx
         .journal()
         .unwrap()
