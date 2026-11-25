@@ -14,8 +14,10 @@ use super::http::{self, BodyDecoder, ResponseHead};
 use super::messages::{AskRequest, DiscoverRequest, DiscoverResponse, Offer};
 use super::plist;
 
-/// ASK-2a: longer than the receiver's 15 s, so a slow user isn't cut off.
-pub const ASK_TIMEOUT: Duration = Duration::from_secs(20);
+/// ASK-2a: about as long as Apple's senders wait. An iPhone keeps its
+/// prompt up until the sender gives up, so this is how long its user has to
+/// tap Accept.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long to wait for the `/Upload` response once the body is sent.
 pub const UPLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -132,14 +134,18 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
     plist_request(Path::Ask, &request.to_plist())
 }
 
-/// The `/Upload` head for a body of `len` bytes (UP-1a, UP-9, UP-10).
-pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64) -> Vec<u8> {
+/// The `/Upload` head for a body of `len` bytes, of files totalling
+/// `total` bytes uncompressed (UP-1a, UP-9, UP-10). Receivers draw transfer
+/// progress against `TotalBytes`: given `0`, an iPhone jumps partway and
+/// stalls until the transfer finishes.
+pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64, total: u64) -> Vec<u8> {
     let len = len.to_string();
+    let total = total.to_string();
     head(
         Path::Upload,
         &[
             ("TransferID", transfer_id),
-            ("TotalBytes", "0"),
+            ("TotalBytes", &total),
             ("Content-Type", compressor.content_type()),
             ("Connection", "keep-alive"),
             ("Content-Length", &len),
@@ -155,6 +161,7 @@ pub fn uti(name: &str, is_directory: bool) -> &'static str {
     }
     let ext = name
         .rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
@@ -165,19 +172,31 @@ pub fn uti(name: &str, is_directory: bool) -> &'static str {
         "heif" => "public.heif",
         "tif" | "tiff" => "public.tiff",
         "webp" => "org.webmproject.webp",
+        "bmp" => "com.microsoft.bmp",
+        "svg" => "public.svg-image",
+        "avif" => "public.avif",
         "mov" => "com.apple.quicktime-movie",
         "mp4" => "public.mpeg-4",
+        "m4v" => "com.apple.m4v-video",
+        "avi" => "public.avi",
         "m4a" => "com.apple.m4a-audio",
         "mp3" => "public.mp3",
+        "aac" => "public.aac-audio",
+        "flac" => "org.xiph.flac",
+        "aif" | "aiff" => "public.aiff-audio",
         "wav" => "com.microsoft.waveform-audio",
         "pdf" => "com.adobe.pdf",
+        "epub" => "org.idpf.epub-container",
         "txt" | "text" => "public.plain-text",
         "md" => "net.daringfireball.markdown",
         "html" | "htm" => "public.html",
+        "xml" => "public.xml",
         "rtf" => "public.rtf",
         "vcf" => "public.vcard",
         "ics" => "com.apple.ical.ics",
         "zip" => "public.zip-archive",
+        "tar" => "public.tar-archive",
+        "gz" | "gzip" => "org.gnu.gnu-zip-archive",
         "json" => "public.json",
         "csv" => "public.comma-separated-values-text",
         "doc" => "com.microsoft.word.doc",
@@ -322,6 +341,8 @@ pub struct Transfer {
     transfer_id: String,
     is_url: bool,
     upload: Option<(Compressor, u64)>,
+    /// Sum of the offered files' uncompressed sizes, for `TotalBytes` (UP-10).
+    total_bytes: u64,
     reader: ResponseReader,
     actions: VecDeque<Action>,
 }
@@ -336,6 +357,10 @@ impl Transfer {
         upload: Option<(Compressor, u64)>,
     ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
+        let total_bytes = match offer {
+            Offer::Files(files) => files.iter().filter_map(|f| f.size).sum(),
+            Offer::Urls(_) => 0,
+        };
         let actions = VecDeque::from([
             Action::Transmit(ask_request(config, transfer_id, offer)),
             Action::SetTimer(Some(config.ask_timeout)),
@@ -345,6 +370,7 @@ impl Transfer {
             transfer_id: transfer_id.into(),
             is_url,
             upload,
+            total_bytes,
             reader: ResponseReader::new(),
             actions,
         }
@@ -426,6 +452,7 @@ impl Transfer {
                         &self.transfer_id,
                         compressor,
                         len,
+                        self.total_bytes,
                     )));
                 }
             }
@@ -481,7 +508,7 @@ mod tests {
         for request in [
             discover_request(),
             ask_request(&config, "ID", &file_offer()),
-            upload_head("ID", Compressor::Gzip, 0),
+            upload_head("ID", Compressor::Gzip, 0, 0),
         ] {
             let (head, _) = http::parse_request(&request, &http::Limits::default())
                 .unwrap()
@@ -509,6 +536,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.headers.get("TransferID"), Some("ID"));
+        // The offered file's size, not the compressed body's (UP-10).
+        assert_eq!(head.headers.get("TotalBytes"), Some("5"));
         assert_eq!(head.body, BodyKind::Length(10));
         t.upload_sent();
         t.receive(&response(200, b""));
@@ -516,6 +545,25 @@ mod tests {
             drain(&mut t).last(),
             Some(&Action::Done(Outcome::Delivered))
         );
+    }
+
+    // spec: SEC-10
+    #[test]
+    fn stalled_upload_fails_immediately_on_timeout() {
+        let config = Config::new("Test", "0123456789ab");
+        let mut t = Transfer::new(&config, "ID", &file_offer(), Some((Compressor::Gzip, 10)));
+        drain(&mut t);
+        t.receive(&response(
+            200,
+            &plist::to_bytes(&AskResponse::default().to_plist()),
+        ));
+        assert!(matches!(drain(&mut t).last(), Some(Action::SendUpload(_))));
+        t.timeout();
+        assert_eq!(
+            drain(&mut t).last(),
+            Some(&Action::Done(Outcome::Failed("timed out".into())))
+        );
+        assert!(t.is_done());
     }
 
     // spec: ASK-1
@@ -540,6 +588,15 @@ mod tests {
     #[test]
     fn ask_timeout_outlasts_the_receivers() {
         assert!(ASK_TIMEOUT > crate::proto::receiver::ASK_TIMEOUT);
+    }
+
+    #[test]
+    fn uti_handles_extensions_and_dotfiles() {
+        assert_eq!(uti("dir", true), "public.folder");
+        assert_eq!(uti("PHOTO.JPG", false), "public.jpeg");
+        assert_eq!(uti("clip.m4v", false), "com.apple.m4v-video");
+        assert_eq!(uti(".png", false), "public.data");
+        assert_eq!(uti("README", false), "public.data");
     }
 
     #[test]

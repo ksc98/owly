@@ -155,6 +155,13 @@ impl Sender {
                         let file = archive.as_mut().expect("a file share has an archive");
                         match upload(&mut tls, &head, file, events.as_ref()).await {
                             Ok(()) => transfer.upload_sent(),
+                            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                // SEC-10: the receiver stopped reading, so
+                                // fail now instead of waiting another
+                                // UPLOAD_RESPONSE_TIMEOUT.
+                                tracing::debug!("upload stalled: {e}");
+                                transfer.timeout();
+                            }
                             Err(e) => {
                                 // The receiver may have refused and closed;
                                 // its response, if any, says why.
@@ -269,49 +276,66 @@ fn uuid_v4() -> io::Result<String> {
     ))
 }
 
-/// Builds the `/Ask` offer for `paths` and compresses their archive into a
-/// temporary file, returning it rewound with its length.
-pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, File, u64)> {
-    let mut items = Vec::new();
+/// Checks that `paths` can be offered and archived before taking the radio
+/// or discovering peers.
+pub fn validate_files(paths: &[PathBuf]) -> io::Result<()> {
+    collect_items(paths).map(drop)
+}
+
+fn collect_items(paths: &[PathBuf]) -> io::Result<Vec<(String, PathBuf, std::fs::Metadata)>> {
+    let mut items: Vec<(String, PathBuf, std::fs::Metadata)> = Vec::new();
     for path in paths {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
         RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
-        if items.iter().any(|(n, _): &(String, PathBuf)| n == name) {
+        if items.iter().any(|(n, _, _)| n == name) {
             return Err(invalid(format!("two items are called {name}")));
         }
-        items.push((name.to_string(), path.clone()));
+        let meta = std::fs::metadata(path)?;
+        if meta.is_file() {
+            if meta.len() > cpio::ODC_MAX_SIZE {
+                return Err(invalid(format!(
+                    "{} is too large for an archive",
+                    path.display()
+                )));
+            }
+        } else if !meta.is_dir() {
+            return Err(invalid(format!(
+                "{} isn't a file or directory",
+                path.display()
+            )));
+        }
+        items.push((name.to_string(), path.clone(), meta));
     }
     if items.is_empty() {
         return Err(invalid("nothing to send".into()));
     }
+    Ok(items)
+}
+
+/// Builds the `/Ask` offer for `paths` and compresses their archive into a
+/// temporary file, returning it rewound with its length.
+pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, File, u64)> {
+    let items = collect_items(paths)?;
 
     let mut spool = tempfile::tempfile()?;
     let mut writer = ArchiveWriter {
         encoder: Encoder::new(compressor, Compression::fast()),
         out: io::BufWriter::new(&mut spool),
         ino: 1,
+        buf: vec![0; 64 << 10],
     };
     // UP-2a: the root entry first.
-    writer.entry(
-        &dir_entry(".", mtime(&std::fs::metadata(&items[0].1)?)),
-        None,
-    )?;
+    writer.entry(&dir_entry(".", mtime(&items[0].2)), None)?;
     let mut files = Vec::new();
-    for (name, path) in &items {
-        let meta = std::fs::metadata(path)?;
+    for (name, path, meta) in &items {
         let size = if meta.is_dir() {
             writer.tree(path, &format!("./{name}"))?
-        } else if meta.is_file() {
-            writer.file(path, &format!("./{name}"), &meta)?;
-            meta.len()
         } else {
-            return Err(invalid(format!(
-                "{} isn't a file or directory",
-                path.display()
-            )));
+            writer.file(path, &format!("./{name}"), meta)?;
+            meta.len()
         };
         files.push(AskFile {
             name: name.clone(),
@@ -373,6 +397,7 @@ struct ArchiveWriter<W: Write> {
     encoder: Encoder,
     out: W,
     ino: u32,
+    buf: Vec<u8>,
 }
 
 impl<W: Write> ArchiveWriter<W> {
@@ -384,9 +409,9 @@ impl<W: Write> ArchiveWriter<W> {
         self.out.write_all(&header)?;
         if let Some(data) = data {
             let mut left = entry.size;
-            let mut buf = vec![0; 64 << 10];
+            let cap = self.buf.len();
             while left > 0 {
-                let n = data.read(&mut buf[..(left as usize).min(64 << 10)])?;
+                let n = data.read(&mut self.buf[..(left as usize).min(cap)])?;
                 if n == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -394,7 +419,7 @@ impl<W: Write> ArchiveWriter<W> {
                     ));
                 }
                 left -= n as u64;
-                let compressed = self.encoder.write(&buf[..n]);
+                let compressed = self.encoder.write(&self.buf[..n]);
                 self.out.write_all(&compressed)?;
             }
         }
@@ -473,5 +498,32 @@ mod tests {
         // No TXT yet, or flags no valid receiver sends.
         assert_eq!(compressor(0), Compressor::DvZip);
         assert_eq!(compressor(0x001), Compressor::DvZip);
+    }
+
+    #[test]
+    fn validate_files_rejects_missing_and_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let dup = sub.join("a.txt");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&dup, b"two").unwrap();
+
+        assert!(validate_files(&[a.clone(), sub.clone()]).is_ok());
+        assert_eq!(
+            validate_files(&[dir.path().join("missing.txt")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            validate_files(&[a, dup]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_files(&[]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

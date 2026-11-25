@@ -22,9 +22,21 @@ pub struct Mdns {
     burst: Option<Burst>,
 }
 
-/// A registered service, withdrawn when dropped.
+/// A registered service, withdrawn when dropped or explicitly via
+/// [`Registration::unregister`].
 pub struct Registration {
-    _stop: oneshot::Sender<()>,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Registration {
+    /// Withdraws the service and waits for the goodbye announcement to be sent.
+    pub async fn unregister(mut self) {
+        self.stop.take();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 /// A running browse, which stops when dropped.
@@ -55,8 +67,11 @@ impl Mdns {
         let socket = self.socket()?;
         let (stop, stopped) = oneshot::channel::<()>();
         let this = self.clone();
-        tokio::spawn(async move { this.respond(socket, service, stopped).await });
-        Ok(Registration { _stop: stop })
+        let task = tokio::spawn(async move { this.respond(socket, service, stopped).await });
+        Ok(Registration {
+            stop: Some(stop),
+            task: Some(task),
+        })
     }
 
     /// Browses `_airdrop._tcp` until the browse is dropped (MDNS-6).

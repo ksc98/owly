@@ -354,6 +354,9 @@ impl Task {
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
                     }
                     Event::Urls(urls) => {
+                        // ASK-4: a URL share is complete once accepted; no
+                        // `/Upload` follows.
+                        held.update(|s| s.busy = false);
                         let _ = self.events.send(ReceiverEvent::Urls { id, urls }).await;
                     }
                     Event::UploadStarted => match Staging::new(&self.options.destination).await {
