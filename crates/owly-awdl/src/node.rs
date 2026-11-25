@@ -836,7 +836,8 @@ impl Node {
             let peer = &self.peers[&dst];
             let rate = self.cfg.rate.for_peer(peer.ht.as_ref());
             let mut batch = Vec::from([q]);
-            if self.cfg.amsdu && peer.ht.is_some() {
+            let use_amsdu = self.cfg.amsdu && peer.ht.is_some();
+            if use_amsdu {
                 let limit = peer
                     .ht
                     .map_or(AMSDU_DEFAULT_MAX, |h| h.max_amsdu())
@@ -865,7 +866,11 @@ impl Node {
             let awdl_seq = self.awdl_seq;
             self.awdl_seq = self.awdl_seq.wrapping_add(batch.len() as u16);
             let bytes = if batch.len() == 1 {
-                frame::data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                if use_amsdu {
+                    frame::qos_data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                } else {
+                    frame::data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                }
             } else {
                 let packets: Vec<&[u8]> = batch.iter().map(|q| q.packet.data.as_slice()).collect();
                 self.stats.tx_amsdu += 1;

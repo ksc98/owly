@@ -315,6 +315,22 @@ pub fn data_frame(src: MacAddr, dst: MacAddr, seq: u16, awdl_seq: u16, packet: &
     out
 }
 
+/// AWDL-13: a QoS data frame (TID 0) carrying one IPv6 packet, used beside
+/// A-MSDUs so single packets stay in the same 802.11 QoS TID stream.
+pub fn qos_data_frame(
+    src: MacAddr,
+    dst: MacAddr,
+    seq: u16,
+    awdl_seq: u16,
+    packet: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + 2 + DATA_HEADER_LEN + packet.len());
+    put_header(&mut out, fc::QOS_DATA, dst, src, seq);
+    out.le16(0x0000); // QoS control: TID 0, single MSDU
+    put_msdu(&mut out, awdl_seq, packet);
+    out
+}
+
 /// The bytes one packet adds to an A-MSDU, less the up to 3 bytes of
 /// padding that may come before it.
 pub fn amsdu_subframe_len(packet_len: usize) -> usize {
@@ -414,6 +430,29 @@ mod tests {
         let m = msdus(&header, amsdu, body).unwrap();
         assert_eq!(
             m,
+            vec![Msdu {
+                dst: B,
+                src: A,
+                ethertype: 0x86dd,
+                payload: &packet
+            }]
+        );
+
+        let qos = qos_data_frame(A, B, 0x124, 8, &packet);
+        let Received::Data {
+            header,
+            amsdu,
+            body,
+        } = parse(&qos).unwrap()
+        else {
+            panic!("not qos data");
+        };
+        assert_eq!(
+            (header.fc, header.src, header.dst, header.seq, amsdu),
+            (fc::QOS_DATA, A, B, 0x124, false)
+        );
+        assert_eq!(
+            msdus(&header, amsdu, body).unwrap(),
             vec![Msdu {
                 dst: B,
                 src: A,

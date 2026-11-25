@@ -572,6 +572,7 @@ fn amsdu_never_reorders_packets_for_the_same_peer() {
         .collect();
     let mut delivered_seqs = Vec::new();
     let mut frame_sizes = Vec::new();
+    let mut frame_kinds = Vec::new();
     for f in transmits(&actions) {
         if f.to != PHONE {
             continue;
@@ -584,6 +585,7 @@ fn amsdu_never_reorders_packets_for_the_same_peer() {
         else {
             continue;
         };
+        frame_kinds.push((header.fc, amsdu));
         let msdus = frame::msdus(&header, amsdu, body).unwrap();
         frame_sizes.push(msdus.len());
         for m in msdus {
@@ -592,4 +594,9 @@ fn amsdu_never_reorders_packets_for_the_same_peer() {
     }
     assert_eq!(delivered_seqs, [0, 1, 2], "TCP order preserved");
     assert_eq!(frame_sizes, [1, 2], "p0 alone, then p1+p2 coalesced");
+    assert_eq!(
+        frame_kinds,
+        [(frame::fc::QOS_DATA, false), (frame::fc::QOS_DATA, true)],
+        "single frames beside A-MSDUs stay QoS Data (TID 0) so frames don't reorder"
+    );
 }
