@@ -8,8 +8,8 @@
 //!   it until Ctrl-C, for interop tests; polkit decides who may.
 //! - `owly radio peers`: the AWDL peers of the session that's up.
 //! - `owly receive`, `owly send` and `owly browse`: AirDrop on one
-//!   interface, `awdl0` by default, as yourself. Take the radio with
-//!   `owly radio up` first.
+//!   interface, `awdl0` by default, as yourself. Takes the radio from owlyd
+//!   automatically when `awdl0` isn't already up.
 //! - `owly test-card`: walks a tester through a photo each way, watches
 //!   Wi-Fi after teardown, and writes a JSON report.
 //! - `owly capture`: records an AWDL session for the capture corpus, on

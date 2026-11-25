@@ -26,6 +26,33 @@ pub fn exit_code(e: &zbus::Error) -> (u8, String) {
     }
 }
 
+/// The radio, taken for one command: `owly send`, `owly browse` or
+/// `owly receive` with no `awdl0` up, which would otherwise need
+/// `owly radio up` in another terminal first. owlyd ends the lease if this
+/// process dies first.
+pub struct Held {
+    radio: RadioProxy<'static>,
+    lease: u64,
+    wifi: Vec<wifi::Connection>,
+}
+
+impl Held {
+    pub async fn take(bus: Option<&str>) -> Result<Held, String> {
+        let radio = connect(bus).await?;
+        eprintln!("bringing the radio up...");
+        let wifi = wifi::active();
+        let (lease, _) = radio.acquire(0).await.map_err(|e| exit_code(&e).1)?;
+        Ok(Held { radio, lease, wifi })
+    }
+
+    pub async fn release(self) {
+        if let Err(e) = self.radio.release(self.lease).await {
+            eprintln!("owly: giving the radio back: {e}");
+        }
+        wifi::restore(self.wifi).await;
+    }
+}
+
 /// Takes the radio and holds it until Ctrl-C, SIGTERM, the duration or
 /// the link's end.
 pub async fn up(bus: Option<&str>, duration: u32) -> Result<ExitCode, String> {

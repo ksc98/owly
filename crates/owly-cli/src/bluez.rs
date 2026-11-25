@@ -208,8 +208,18 @@ impl Link {
     }
 }
 
-/// Unregisters the advert when dropped.
+/// Unregisters the advert when stopped or dropped. Call [`Registration::stop`]
+/// before exiting the runtime so unregistration and powering the adapter back
+/// off finish before the process ends.
 pub struct Registration(Option<Link>);
+
+impl Registration {
+    pub async fn stop(mut self) {
+        if let Some(link) = self.0.take() {
+            link.unregister().await;
+        }
+    }
+}
 
 impl Drop for Registration {
     fn drop(&mut self) {

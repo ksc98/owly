@@ -8,7 +8,7 @@
 //! tries the radio's AWDL peers beside mDNS (DISC-5), both as owlyd's D-Bus
 //! API says.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use owly_airdrop::driver::mdns::Mdns;
 use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent, Request};
-use owly_airdrop::driver::sender::{Event, Payload, Sender};
+use owly_airdrop::driver::sender::{self as sender_driver, Event, Payload, Sender};
 use owly_airdrop::driver::tls::Identity;
 use owly_airdrop::proto::ble::Advert;
 use owly_airdrop::proto::mdns::{self, BrowseEvent, RECEIVER_FLAGS, SUPPORTS_DVZIP, Service};
@@ -28,6 +28,7 @@ use owly_awdl::MacAddr;
 use owly_radio::radio::Announce;
 use owlyd::api::{self, LinkInfo, RadioProxy};
 use tokio::io::AsyncBufReadExt;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::bluez::{BluezAdvertiser, Registration};
 
@@ -111,6 +112,21 @@ pub struct SendArgs {
 }
 
 impl On {
+    /// The radio, when the interface is owlyd's and isn't up yet.
+    async fn hold(&self, bus: Option<&str>) -> io::Result<Option<crate::radio::Held>> {
+        if self.iface != owly_radio::injection::AWDL_IFACE
+            || std::path::Path::new("/sys/class/net")
+                .join(&self.iface)
+                .exists()
+        {
+            return Ok(None);
+        }
+        crate::radio::Held::take(bus)
+            .await
+            .map(Some)
+            .map_err(io::Error::other)
+    }
+
     fn resolve(&self) -> io::Result<(Interface, String)> {
         // rustls needs a crypto provider chosen; ring is owly-cli's.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -123,27 +139,54 @@ impl On {
     }
 }
 
-/// `owly receive`.
-pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
-    let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
-    let announce = match Lease::find(bus, &iface.name).await {
-        Ok(lease) => lease.link.announce,
-        Err(e) => {
-            eprintln!("not announcing as the radio asks: {e}");
-            None
+/// Resolves on Ctrl-C or SIGTERM so commands holding the radio or a BLE
+/// advert can release them cleanly instead of exiting mid-session.
+async fn interrupt() {
+    let mut term = signal(SignalKind::terminate()).ok();
+    let terminate = async {
+        match &mut term {
+            Some(sig) => {
+                let _ = sig.recv().await;
+            }
+            None => std::future::pending::<()>().await,
         }
     };
-    run_receiver(&iface, name, burst(announce), args)
-        .await
-        .map_err(|e| e.to_string())
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
+}
+
+/// `owly receive`.
+pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
+    let held = args.on.hold(bus).await.map_err(|e| e.to_string())?;
+    let result = async {
+        let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
+        let announce = match Lease::find(bus, &iface.name).await {
+            Ok(lease) => lease.link.announce,
+            Err(e) => {
+                eprintln!("not announcing as the radio asks: {e}");
+                None
+            }
+        };
+        run_receiver(&iface, name, burst(announce), args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    if let Some(held) = held {
+        held.release().await;
+    }
+    result
 }
 
 /// `owly browse`: by mDNS and, on an owlyd lease, by `/Discover` at the
 /// radio's AWDL peers (DISC-5), as `owly send` finds them.
 pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, String> {
-    async {
+    let held = args.on.hold(bus).await.map_err(|e| e.to_string())?;
+    let advert = advertise(args.no_ble).await;
+    let work = async {
         let (iface, name) = args.on.resolve()?;
-        let _advert = advertise(args.no_ble).await;
         let sender = Sender::new(sender::Config::new(name, random_service_id()?))?;
         let limit = Duration::from_secs(args.seconds);
         let deadline = tokio::time::Instant::now() + limit;
@@ -151,7 +194,7 @@ pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, Str
             .await
             .inspect_err(|e| eprintln!("not trying the radio's AWDL peers: {e}"))
             .ok();
-        let seen = std::cell::RefCell::new(std::collections::HashSet::new());
+        let seen = std::cell::RefCell::new(HashSet::new());
         let show = |r: &Listed| {
             if seen.borrow_mut().insert(r.addr) {
                 println!("{:<14} {:?} ({})", r.instance, r.name, r.addr);
@@ -180,17 +223,22 @@ pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, Str
             Ok(()) => {}
         }
         Ok(ExitCode::SUCCESS)
+    };
+    let result = tokio::select! {
+        r = work => r.map_err(|e: io::Error| e.to_string()),
+        () = interrupt() => Ok(ExitCode::SUCCESS),
+    };
+    if let Some(advert) = advert {
+        advert.stop().await;
     }
-    .await
-    .map_err(|e: io::Error| e.to_string())
+    if let Some(held) = held {
+        held.release().await;
+    }
+    result
 }
 
 /// `owly send`.
 pub async fn send(bus: Option<&str>, args: SendArgs) -> Result<ExitCode, String> {
-    send_inner(bus, args).await.map_err(|e| e.to_string())
-}
-
-async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
     let SendArgs {
         on,
         to,
@@ -200,28 +248,59 @@ async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
         no_ble,
         files,
     } = args;
-    let (iface, name) = on.resolve()?;
+    // Validate arguments and files before taking the radio or advertising
+    // over BLE, so a typo fails immediately without dropping Wi-Fi.
     let payload = match (url.is_empty(), files.is_empty()) {
         (false, true) => Payload::Urls(url),
-        (true, false) => Payload::Files(
-            files
+        (true, false) => {
+            let paths: Vec<PathBuf> = files
                 .iter()
                 .map(std::path::absolute)
-                .collect::<Result<_, _>>()?,
-        ),
-        _ => return Err(io::Error::other("give either files or --url, not both")),
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            sender_driver::validate_files(&paths).map_err(|e| e.to_string())?;
+            Payload::Files(paths)
+        }
+        _ => return Err("give either files or --url, not both".into()),
     };
-    let _advert = advertise(no_ble).await;
+    let mac = match mac {
+        Some(text) => Some((parse_mac(&text).map_err(|e| e.to_string())?, text)),
+        None => None,
+    };
+
+    let held = on.hold(bus).await.map_err(|e| e.to_string())?;
+    let advert = advertise(no_ble).await;
+    let result = tokio::select! {
+        r = send_inner(bus, &on, payload, to, mac, seconds) => r.map_err(|e| e.to_string()),
+        () = interrupt() => Ok(ExitCode::from(130)),
+    };
+    if let Some(advert) = advert {
+        advert.stop().await;
+    }
+    if let Some(held) = held {
+        held.release().await;
+    }
+    result
+}
+
+async fn send_inner(
+    bus: Option<&str>,
+    on: &On,
+    payload: Payload,
+    to: Option<String>,
+    mac: Option<(MacAddr, String)>,
+    seconds: u64,
+) -> io::Result<ExitCode> {
+    let (iface, name) = on.resolve()?;
     let sender = Sender::new(sender::Config::new(name, random_service_id()?))?;
     let target = match mac {
-        Some(mac) => {
-            let addr =
-                SocketAddrV6::new(parse_mac(&mac)?.link_local(), AIRDROP_PORT, 0, iface.index);
+        Some((mac_addr, mac_text)) => {
+            let addr = SocketAddrV6::new(mac_addr.link_local(), AIRDROP_PORT, 0, iface.index);
             let receiver = knock(&sender, addr, Duration::from_secs(seconds))
                 .await?
                 .ok_or_else(|| io::Error::other("the receiver at that address doesn't list us"))?;
             Listed {
-                instance: mac,
+                instance: mac_text,
                 name: receiver.computer_name,
                 addr,
                 // UP-1b: no TXT to say, and Apple receivers take DVZip.
@@ -250,13 +329,19 @@ async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
     eprintln!("sending to {:?} at {}", target.name, target.addr);
     let (events, mut updates) = tokio::sync::mpsc::unbounded_channel();
     let printer = tokio::spawn(async move {
+        let mut showed_progress = false;
         while let Some(event) = updates.recv().await {
             match event {
                 Event::Accepted => eprintln!("accepted"),
-                Event::Progress(p) => eprint!("\r{} / {} bytes", p.sent, p.total),
+                Event::Progress(p) => {
+                    showed_progress = true;
+                    eprint!("\r{} / {} bytes", p.sent, p.total);
+                }
             }
         }
-        eprintln!();
+        if showed_progress {
+            eprintln!();
+        }
     });
     let outcome = sender
         .send(target.addr, &payload, target.flags, Some(events))
@@ -519,7 +604,10 @@ async fn knock_peers(
 }
 
 /// `/Discover` at each of the lease's AWDL peers until `deadline`, handing
-/// each one that answers to `on_listed` once, until it says to stop.
+/// each one that answers to `on_listed` once, until it says to stop. Every
+/// peer is asked at once: each `/Discover` is a TLS handshake across the
+/// air, and asked in turn, a phone waited out every Mac and silent device
+/// ahead of it.
 async fn discover_peers(
     iface: &Interface,
     sender: &Sender,
@@ -527,39 +615,76 @@ async fn discover_peers(
     deadline: tokio::time::Instant,
     mut on_listed: impl FnMut(Listed) -> bool,
 ) {
-    let mut tried = std::collections::HashSet::new();
-    let mut answered = std::collections::HashSet::new();
-    while tokio::time::Instant::now() < deadline {
-        for mac in lease.peers().await {
-            if answered.contains(&mac) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    const RETRY_COOLDOWN: Duration = Duration::from_millis(500);
+
+    let mut tried = HashSet::new();
+    let mut answered = HashSet::new();
+    let mut asking = HashSet::new();
+    let mut retry_at: HashMap<MacAddr, tokio::time::Instant> = HashMap::new();
+    let mut pending = FuturesUnordered::new();
+
+    let ask = |mac: MacAddr, now: tokio::time::Instant| {
+        let addr = SocketAddrV6::new(mac.link_local(), AIRDROP_PORT, 0, iface.index);
+        // A peer that refuses fails at once (and waits out RETRY_COOLDOWN);
+        // a silent one is asked again once this gives up on it.
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_secs(3));
+        async move {
+            let found = tokio::time::timeout(wait, sender.discover(addr)).await;
+            (mac, addr, found)
+        }
+    };
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let peers = lease.peers().await;
+        // Drop expired cooldowns and peers that left, so `retry_at` only
+        // holds future wakeups for active peers.
+        retry_at.retain(|mac, &mut at| at > now && peers.contains(mac));
+        for mac in peers {
+            if answered.contains(&mac) || asking.contains(&mac) || retry_at.contains_key(&mac) {
                 continue;
             }
+            asking.insert(mac);
             if tried.insert(mac) {
                 eprintln!("trying AWDL peer {mac}");
             }
-            let addr = SocketAddrV6::new(mac.link_local(), AIRDROP_PORT, 0, iface.index);
-            // A peer that refuses fails at once; one that's silent mustn't
-            // hold up the others for long.
-            let wait = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .min(Duration::from_secs(3));
-            let Ok(Ok(Some(receiver))) = tokio::time::timeout(wait, sender.discover(addr)).await
-            else {
-                continue;
-            };
-            answered.insert(mac);
-            let listed = Listed {
-                instance: mac.to_string(),
-                name: receiver.computer_name,
-                addr,
-                // UP-1b: no TXT to say, and Apple receivers take DVZip.
-                flags: RECEIVER_FLAGS | SUPPORTS_DVZIP,
-            };
-            if on_listed(listed) {
-                return;
-            }
+            pending.push(ask(mac, now));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wake either when the earliest cooled-down peer is ready to retry,
+        // or every 500 ms to pick up newly appeared AWDL peers.
+        let rescan = (tokio::time::Instant::now() + RETRY_COOLDOWN)
+            .min(retry_at.values().copied().min().unwrap_or(deadline))
+            .min(deadline);
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => return,
+            Some((mac, addr, found)) = pending.next(), if !pending.is_empty() => {
+                asking.remove(&mac);
+                let Ok(Ok(Some(receiver))) = found else {
+                    retry_at.insert(mac, tokio::time::Instant::now() + RETRY_COOLDOWN);
+                    continue;
+                };
+                retry_at.remove(&mac);
+                answered.insert(mac);
+                let listed = Listed {
+                    instance: mac.to_string(),
+                    name: receiver.computer_name,
+                    addr,
+                    // UP-1b: no TXT to say, and Apple receivers take DVZip.
+                    flags: RECEIVER_FLAGS | SUPPORTS_DVZIP,
+                };
+                if on_listed(listed) {
+                    return;
+                }
+            }
+            () = tokio::time::sleep_until(rescan) => {}
+        }
     }
 }
 
@@ -619,7 +744,10 @@ async fn browse_receivers(
             continue;
         };
         let addr = SocketAddrV6::new(found.addr, found.port, 0, iface.index);
-        match sender.discover(addr).await {
+        let Ok(discovered) = tokio::time::timeout_at(deadline, sender.discover(addr)).await else {
+            return Ok(());
+        };
+        match discovered {
             Ok(Some(receiver)) => {
                 let listed = Listed {
                     instance: found.instance,
@@ -664,7 +792,7 @@ async fn run_receiver(
     tokio::spawn(receiver.run());
 
     let service_id = random_service_id()?;
-    let _registration = if no_mdns {
+    let registration = if no_mdns {
         None
     } else {
         let service = Service {
@@ -689,9 +817,11 @@ async fn run_receiver(
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     let mut pending: Option<Request> = None;
     let mut queued: VecDeque<Request> = VecDeque::new();
+    let mut term = signal(SignalKind::terminate())?;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
+            _ = tokio::signal::ctrl_c() => break,
+            _ = term.recv() => break,
             line = stdin.next_line(), if pending.is_some() => {
                 let request = pending.take().unwrap();
                 match line {
@@ -702,7 +832,7 @@ async fn run_receiver(
             }
             event = events.recv() => {
                 let Some(event) = event else {
-                    return Ok(ExitCode::SUCCESS);
+                    break;
                 };
                 match event {
                     ReceiverEvent::Discovered { peer, .. } => eprintln!("seen by {peer}"),
@@ -744,6 +874,10 @@ async fn run_receiver(
             }
         }
     }
+    if let Some(registration) = registration {
+        registration.unregister().await;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn show_offer(request: &Request) {
