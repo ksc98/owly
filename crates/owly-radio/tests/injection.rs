@@ -316,9 +316,20 @@ impl Ops for FakeOps {
     fn mt76_dir(&self, phy: &str) -> PathBuf {
         PathBuf::from(format!("/debug/{phy}/mt76"))
     }
+    fn rfkill_dir(&self, phy: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(format!("/rfkill/{phy}")))
+    }
     fn read(&self, path: &Path) -> Option<String> {
         if path.starts_with("/debug") {
             return Some("1".into());
+        }
+        if let Ok(switch) = path.strip_prefix("/rfkill/phy0") {
+            // `rfkill.soft` or `rfkill.hard` in the test's directory blocks it.
+            let blocked = self
+                .dir
+                .join(format!("rfkill.{}", switch.display()))
+                .exists();
+            return Some(if blocked { "1" } else { "0" }.into());
         }
         if path.ends_with("disable_ipv6") {
             return Some("0".into());
@@ -446,10 +457,12 @@ impl Fx {
     fn backend_with(&self, settings: Settings) -> Injection {
         let dir = self.dir.path().to_path_buf();
         let started = self.awdl.clone();
-        let start: StartAwdl = Arc::new(move |monitor, tap, cfg, peers| {
+        let start: StartAwdl = Arc::new(move |monitor, tap, ap, cfg, peers| {
             assert_eq!((monitor, tap), (MONITOR, "awdl0"));
             *started.lock().unwrap() = Some((cfg, true));
             std::fs::write(dir.join("awdl0"), "").unwrap();
+            // The interface peers become stations on, if any.
+            std::fs::write(dir.join("awdl0.ap"), ap.unwrap_or("")).unwrap();
             let phone = PeerInfo {
                 mac: PHONE.parse().unwrap(),
                 name: "iPhone".into(),
@@ -885,6 +898,57 @@ async fn a_card_that_refuses_a_cell_beside_its_station_becomes_the_cell() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn exclusive_mode_switches_wifi_on_for_the_session() {
+    let fx = Fx::with(|o| {
+        o.driver = "rtw89_8852bu".into();
+        o.wiphy
+            .lock()
+            .unwrap()
+            .iftypes
+            .retain(|t| *t != IfType::Adhoc);
+    });
+    std::fs::write(fx.dir.path().join("rfkill.soft"), "").unwrap();
+    let mut settings = fx.settings();
+    settings.allow_untested = true;
+    let mut backend = fx.backend_with(settings);
+    backend.up().await.unwrap();
+    let calls = fx.ops.calls();
+    assert!(
+        calls.contains(&"write /rfkill/phy0/soft 0".into()),
+        "{calls:?}"
+    );
+    assert!(fx.journal().unwrap().contains(&Step::Rfkill {
+        dir: "/rfkill/phy0".into()
+    }));
+    let n = calls.len();
+    backend.down().await.unwrap();
+    // Switched off again last, once the station is given back.
+    assert_eq!(
+        fx.since(n).last().map(String::as_str),
+        Some("write /rfkill/phy0/soft 1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hard_rfkill_block_keeps_the_radio_down() {
+    let fx = Fx::with(|o| {
+        o.driver = "rtw89_8852bu".into();
+        o.wiphy
+            .lock()
+            .unwrap()
+            .iftypes
+            .retain(|t| *t != IfType::Adhoc);
+    });
+    std::fs::write(fx.dir.path().join("rfkill.hard"), "").unwrap();
+    let mut settings = fx.settings();
+    settings.allow_untested = true;
+    let mut backend = fx.backend_with(settings);
+    let e = backend.up().await.unwrap_err();
+    assert!(e.to_string().contains("switched off in hardware"), "{e}");
+    assert!(!fx.awdl_running());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn exclusive_mode_runs_a_hidden_ap_without_ad_hoc_mode() {
     let fx = Fx::with(|o| {
         o.driver = "rtw89_8852bu".into();
@@ -908,12 +972,22 @@ async fn exclusive_mode_runs_a_hidden_ap_without_ad_hoc_mode() {
         "hw_mode=a",
         "beacon_int=1000",
         "wpa=2",
+        // 80 MHz, as the opclass-128 channel AWDL announces.
+        "ieee80211ac=1",
+        "vht_oper_chwidth=1",
+        "vht_oper_centr_freq_seg0_idx=155",
     ] {
         assert!(conf.lines().any(|l| l == line), "{line} in {conf}");
     }
     let calls = fx.ops.calls();
     assert!(calls.contains(&format!("add phy0 {AP} AP")));
     assert!(calls.contains(&format!("mac {AP} {STATION_MAC}")));
+    // Peers are stations on the AP, so frames to them take the firmware's
+    // fast path.
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("awdl0.ap")).unwrap(),
+        AP
+    );
     let hostapd = fx
         .journal()
         .unwrap()

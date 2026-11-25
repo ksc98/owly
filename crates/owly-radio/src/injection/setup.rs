@@ -144,6 +144,7 @@ impl Setup<'_> {
         if self.settings.country.is_none() && self.station.tx_channels(self.settings).is_empty() {
             return Err(no_channels());
         }
+        self.unblock()?;
         // Without one in radio.toml, the country the kernel has from the AP:
         // it forgets it once the station is down, and the world's domain
         // left in its place allows no cell on 5 GHz.
@@ -274,6 +275,29 @@ impl Setup<'_> {
         ops.set_mac(MONITOR, mac)
             .and_then(|()| ops.set_up(MONITOR, true))
             .map_err(|e| Error::no_radio(format!("Couldn't bring up the monitor interface: {e}")))
+    }
+
+    /// Switches Wi-Fi on for the session if it's switched off in software
+    /// (`nmcli radio wifi off`, `rfkill block`): exclusive mode takes the
+    /// card over anyway, and with it blocked hostapd starts no AP. It's
+    /// switched off again when the radio is given back.
+    fn unblock(&mut self) -> Result<(), Error> {
+        let ops = self.ops;
+        let Some(dir) = ops.rfkill_dir(&self.station.phy) else {
+            return Ok(());
+        };
+        if ops.read(&dir.join("hard")).as_deref() == Some("1") {
+            return Err(Error::no_radio(crate::probe::HARD_BLOCKED));
+        }
+        if ops.read(&dir.join("soft")).as_deref() != Some("1") {
+            return Ok(());
+        }
+        self.record(Step::Rfkill { dir: dir.clone() })?;
+        ops.write(&dir.join("soft"), "0").map_err(|e| {
+            Error::no_radio(format!(
+                "Wi-Fi is switched off, and Owly couldn't switch it on: {e}"
+            ))
+        })
     }
 
     /// mt76's runtime power management off for the session, where the
@@ -521,15 +545,21 @@ fn cell_mac(ops: &dyn Ops, iface: &str, mac: MacAddr) {
 
 /// A hidden, WPA2-protected AP with a random name and passphrase, so
 /// nothing ever joins it: it's there for its MAC to ACK the phone.
+///
+/// On 5 GHz it's 80 MHz wide, primary on the social channel. AWDL
+/// announces the channel as operating class 128 (AWDL-10), an 80 MHz
+/// channel, and a phone sends us 80 MHz frames there, which a radio held
+/// to 20 MHz by a 20 MHz AP never decodes.
 fn write_hostapd_conf(path: &Path, channel: u8) -> std::io::Result<()> {
     use std::io::Write;
     let mut random = [0u8; 20];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut random)?;
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let conf = format!(
-        "interface={AP}\ndriver=nl80211\nssid=owly-{}\nignore_broadcast_ssid=1\nhw_mode={}\nchannel={channel}\nieee80211n=1\nbeacon_int=1000\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\n",
+        "interface={AP}\ndriver=nl80211\nssid=owly-{}\nignore_broadcast_ssid=1\nhw_mode={}\nchannel={channel}\nieee80211n=1\n{}beacon_int=1000\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase={}\n",
         hex(&random[..4]),
         if channel == 6 { "g" } else { "a" },
+        vht80_conf(channel),
         hex(&random[4..]),
     );
     let mut f = std::fs::OpenOptions::new()
@@ -539,6 +569,19 @@ fn write_hostapd_conf(path: &Path, channel: u8) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     f.write_all(conf.as_bytes())
+}
+
+/// hostapd's lines for an 80 MHz AP with `channel` as its primary: 149 in
+/// 149-161 (centre 155), 44 in 36-48 (centre 42). Nothing on 2.4 GHz.
+fn vht80_conf(channel: u8) -> String {
+    let (ht40, centre) = match channel {
+        149 => ("HT40+", 155),
+        44 => ("HT40+", 42),
+        _ => return String::new(),
+    };
+    format!(
+        "ht_capab=[{ht40}]\nieee80211ac=1\nvht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx={centre}\n"
+    )
 }
 
 /// hostapd in the foreground, in a process group of its own, logging to

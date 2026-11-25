@@ -68,12 +68,9 @@ notes = "MediaTek MT7927 (TP-Link Archer TBE550E, 14c3:7927, kernel 7.2.9), on t
 
 [drivers.mt7921e]
 status = "untested"
-mode = "active-monitor"
-channels = [6]
-issues = [
-    "This card sends injected unicast at 1 Mbit/s whatever rate is asked for, and not at all on 5 GHz, so discovery and the handshake often stall. Close and reopen the share sheet to retry.",
-]
-notes = "MediaTek MT7921 (14c3:7961, kernel 7.2.9) and MT7922 (14c3:0616, kernels 6.18 and 7.2.5). No ad-hoc mode. Both ways with an iPhone on channel 6, but not reliably: a full frame at 1 Mbit/s CCK fills most of the one slot in sixteen the phone spends on channel 6. Shared mode fails (https://github.com/t4t5/owly/issues/14). On 44, none of 132 injected unicast frames reached the air; on 6, 115 of 121 did."
+mode = "exclusive"
+channels = [149, 44, 6]
+notes = "MediaTek MT7921 (14c3:7961) and MT7922 (14c3:0616). No ad-hoc mode, so exclusive mode runs a hidden AP. Kernel 7.3 stopped advertising active monitor on mt792x (commit 6f6c9800e54c: the firmware stops receiving in that mode). MT7922 on kernel 7.3.5, channel 149, with each peer a station on the AP: 6 MB to an iPhone in 2.8 s, no retries. Without the station entries the firmware held each injected frame 5-14 ms and an upload ran at about 60 KB/s. Shared mode fails (https://github.com/t4t5/owly/issues/14)."
 
 [drivers.mt76x2u]
 status = "tested"

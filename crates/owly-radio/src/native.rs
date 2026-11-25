@@ -6,9 +6,11 @@
 //! a TAP device carrying Ethernet frames, created down, given the AWDL
 //! address as its MAC (AWDL-2) and its EUI-64 link-local address without
 //! DAD (NET-1), MTU 1450 with offloads off, then brought up. Each peer that
-//! turns valid gets a permanent neighbour entry (NET-2). The monitor asks
-//! for MTU 8192 so A-MSDUs fit.
+//! turns valid gets a permanent neighbour entry (NET-2), and, beside a
+//! hidden AP, a station entry on it. The monitor asks for MTU 8192 so
+//! A-MSDUs fit.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -21,6 +23,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
+use crate::nl80211::Nl80211;
 use crate::radiotap;
 use crate::rtnl::Rtnl;
 
@@ -40,10 +43,12 @@ pub struct Native {
 
 impl Native {
     /// Makes `tap` and starts a node with `cfg` on `monitor`, publishing
-    /// its valid peers on `peers`.
+    /// its valid peers on `peers`. With `ap`, the hidden AP the monitor
+    /// sends beside, each valid peer is a station on it.
     pub fn start(
         monitor: &str,
         tap: &str,
+        ap: Option<&str>,
         cfg: Config,
         peers: watch::Sender<Vec<PeerInfo>>,
     ) -> io::Result<Native> {
@@ -71,6 +76,15 @@ impl Native {
         rtnl.add_link_local_nodad(index, mac.link_local())?;
         rtnl.set_up(index, true)?;
 
+        let stations = match ap {
+            Some(ap) => Some(Stations {
+                nl: Nl80211::open()?,
+                ap: if_index(ap)?,
+                vht: cfg.radio.channel.0 != 6,
+                aids: AidPool::default(),
+            }),
+            None => None,
+        };
         let name = tap.to_string();
         let running = driver::spawn(
             cfg,
@@ -85,6 +99,7 @@ impl Native {
                     name,
                     index,
                     rtnl,
+                    stations,
                     buf: vec![0; 16 * 1024],
                 };
                 Ok((monitor, tap))
@@ -173,7 +188,49 @@ struct Tap {
     name: String,
     index: u32,
     rtnl: Rtnl,
+    stations: Option<Stations>,
     buf: Vec<u8>,
+}
+
+/// The hidden AP's station entries, one for each valid peer. mac80211
+/// sends a frame injected from the AP's address out of the AP, to the
+/// station entry for its destination where there is one, and the firmware
+/// sends frames to a station from its fast path, with its own rate
+/// control: an MT7922 held each frame to an address it had no entry for
+/// 5-14 ms, and with entries 6 MB went to an iPhone in under 3 s instead of 100.
+struct Stations {
+    nl: Nl80211,
+    ap: u32,
+    vht: bool,
+    aids: AidPool,
+}
+
+/// Allocates distinct 802.11 Association IDs (`1..=2007`) for active peers on
+/// the hidden AP so simultaneous peers don't collide on one AID.
+#[derive(Default)]
+struct AidPool {
+    by_mac: HashMap<MacAddr, u16>,
+    used: HashSet<u16>,
+}
+
+impl AidPool {
+    const MAX_AID: u16 = 2007;
+
+    fn assign(&mut self, mac: MacAddr) -> Option<u16> {
+        if let Some(&aid) = self.by_mac.get(&mac) {
+            return Some(aid);
+        }
+        let aid = (1..=Self::MAX_AID).find(|a| !self.used.contains(a))?;
+        self.by_mac.insert(mac, aid);
+        self.used.insert(aid);
+        Some(aid)
+    }
+
+    fn release(&mut self, mac: MacAddr) {
+        if let Some(aid) = self.by_mac.remove(&mac) {
+            self.used.remove(&aid);
+        }
+    }
 }
 
 impl Netif for Tap {
@@ -232,10 +289,30 @@ impl Netif for Tap {
         if let Err(e) = self.rtnl.add_neighbour(self.index, mac.link_local(), mac) {
             tracing::warn!("no neighbour entry for {mac}: {e}");
         }
+        if let Some(s) = &mut self.stations {
+            // Clear whatever an earlier session left before adding it with a
+            // fresh, unique AID.
+            let _ = s.nl.del_station(s.ap, mac);
+            match s.aids.assign(mac) {
+                Some(aid) => {
+                    if let Err(e) = s.nl.new_station(s.ap, mac, aid, s.vht) {
+                        s.aids.release(mac);
+                        tracing::warn!(
+                            "no station entry for {mac}, so frames to it go slowly: {e}"
+                        );
+                    }
+                }
+                None => tracing::warn!("no free AID for {mac}, so frames to it go slowly"),
+            }
+        }
     }
 
     fn peer_down(&mut self, mac: MacAddr) {
         let _ = self.rtnl.del_neighbour(self.index, mac.link_local());
+        if let Some(s) = &mut self.stations {
+            s.aids.release(mac);
+            let _ = s.nl.del_station(s.ap, mac);
+        }
     }
 }
 
@@ -366,4 +443,23 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
         tracing::info!("{name} keeps its offloads: {}", io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aid_pool_assigns_distinct_ids_and_reuses_released_ones() {
+        let mut pool = AidPool::default();
+        let a = MacAddr([2, 0, 0, 0, 0, 1]);
+        let b = MacAddr([2, 0, 0, 0, 0, 2]);
+        let c = MacAddr([2, 0, 0, 0, 0, 3]);
+        assert_eq!(pool.assign(a), Some(1));
+        assert_eq!(pool.assign(a), Some(1));
+        assert_eq!(pool.assign(b), Some(2));
+        pool.release(a);
+        assert_eq!(pool.assign(c), Some(1));
+        assert_eq!(pool.assign(a), Some(3));
+    }
 }

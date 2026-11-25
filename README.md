@@ -132,7 +132,7 @@ Make sure you set your phone's Airdrop setting to "Everyone for 10 minutes".
 | Intel BE (Panther Lake) | `iwlwifi` | ✅ Exclusive | XPS 16, `8086:e440`, Arch (kernel 7.2) |
 | Intel BE200 | `iwlwifi` | ✅ Exclusive | • GEEKOM IT13 Max, `8086:272b`, Omarchy 4.0.4 (kernel 7.2.5)<br>• LENOVO Legion Pro 7 16IAX10H, `8086:272b`, Arch Linux (kernel 7.3.4) |
 | MediaTek MT7921 | `mt7921e` | ⚠️ Exclusive, opt-in; shared fails ([#14](https://github.com/t4t5/owly/issues/14)) | `14c3:7961`, CachyOS (kernel 7.2.9) |
-| MediaTek MT7922 (RZ616) | `mt7921e` | ⚠️ Exclusive, opt-in; shared fails ([#14](https://github.com/t4t5/owly/issues/14)) | Minisforum MS-A2, `14c3:0616`, NixOS 26.05 (kernels 6.18 and 7.2.5) |
+| MediaTek MT7922 (RZ616) | `mt7921e` | ⚠️ Exclusive, opt-in: sends to an iPhone at about 2 MB/s on 149; receiving untested; shared fails ([#14](https://github.com/t4t5/owly/issues/14)) | • Minisforum MS-A2, `14c3:0616`, NixOS 26.05 (kernels 6.18 and 7.2.5)<br>• `14c3:0616`, CachyOS (kernel 7.3.5) |
 | MediaTek MT7927 | `mt7925e` | ❌ Shared: never heard; active monitor (opt-in) sends, but receiving times out ([#44](https://github.com/t4t5/owly/issues/44)) | TP-Link Archer TBE550E, `14c3:7927`, CachyOS (kernel 7.2.9) |
 | Realtek RTL8821CE | `rtw88_8821ce` | ❌ Shared: OWL syncs but no transfer, Wi-Fi often lost after ([#60](https://github.com/t4t5/owly/issues/60)); exclusive receives nothing | HP laptop, `10ec:c821`, Omarchy (kernel 7.2.5) |
 | Realtek RTL8821AU (USB) | `rtw88_8821au` | ❌ Exclusive: AWDL syncs but no data gets through ([#93](https://github.com/t4t5/owly/issues/93)); shared untested | TP-Link Archer T2U Plus, `2357:0120`, Ubuntu 24.04.5 (kernel 7.0) |
@@ -172,9 +172,9 @@ owlyd reads `/etc/owly/radio.toml` and `/etc/owly/drivers.toml` again for each `
 
 **Shared.** Wi-Fi stays connected, and AWDL shares the AP's channel, which has to be **6, 44 or 149**. Owly injects frames through a monitor interface with the station's MAC, and advertises only the phone's slots on that channel. The station ACKs the phone's frames.
 
-**Exclusive.** For cards that can't inject while connected, such as every Intel card tested. Wi-Fi is down while the radio is up, and comes back when it's given back. An ad-hoc cell on AWDL's BSSID takes the station's place to ACK the phone's frames, or a hidden AP (hostapd) on cards with no ad-hoc mode. It tries channels 44, 149 and 6 in that order, of those the card may transmit on, since an iPhone gives AWDL more slots on 5 GHz. Intel cards go straight to 6, the only channel where a phone has used their cell.
+**Exclusive.** For cards that can't inject while connected, such as every Intel card tested. Wi-Fi is down while the radio is up, and comes back when it's given back. An ad-hoc cell on AWDL's BSSID takes the station's place to ACK the phone's frames, or a hidden AP (hostapd) on cards with no ad-hoc mode, 80 MHz wide on 5 GHz, with each peer a station on it so its firmware sends to the phone at full speed. It tries channels 44, 149 and 6 in that order, of those the card may transmit on, since an iPhone gives AWDL more slots on 5 GHz. Intel cards go straight to 6, the only channel where a phone has used their cell.
 
-**Active monitor.** For cards with neither, such as the MediaTek MT7612U and MT7921: an active monitor carrying the station's MAC ACKs in place of the cell.
+**Active monitor.** For cards with neither, such as the MediaTek MT7612U: an active monitor carrying the station's MAC ACKs in place of the cell.
 
 A USB adapter can run exclusive mode as a second card while the built-in one stays connected: set `station` to the adapter in `/etc/owly/radio.toml` and disconnect it (`nmcli device disconnect <adapter>`).
 

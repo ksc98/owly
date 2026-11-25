@@ -17,6 +17,8 @@ const CMD_GET_INTERFACE: u8 = 5;
 const CMD_SET_INTERFACE: u8 = 6;
 const CMD_NEW_INTERFACE: u8 = 7;
 const CMD_DEL_INTERFACE: u8 = 8;
+const CMD_NEW_STATION: u8 = 19;
+const CMD_DEL_STATION: u8 = 20;
 const CMD_REQ_SET_REG: u8 = 27;
 const CMD_GET_REG: u8 = 31;
 const CMD_JOIN_IBSS: u8 = 43;
@@ -30,14 +32,20 @@ const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
 const ATTR_BEACON_INTERVAL: u16 = 12;
+const ATTR_STA_AID: u16 = 16;
+const ATTR_STA_LISTEN_INTERVAL: u16 = 18;
+const ATTR_STA_SUPPORTED_RATES: u16 = 19;
 const ATTR_WIPHY_BANDS: u16 = 22;
 const ATTR_MNTR_FLAGS: u16 = 23;
+const ATTR_HT_CAPABILITY: u16 = 31;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_REG_ALPHA2: u16 = 33;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
 const ATTR_SSID: u16 = 52;
 const ATTR_FREQ_FIXED: u16 = 60;
+const ATTR_STA_FLAGS2: u16 = 67;
+const ATTR_VHT_CAPABILITY: u16 = 99;
 const ATTR_INTERFACE_COMBINATIONS: u16 = 120;
 const ATTR_SOFTWARE_IFTYPES: u16 = 121;
 const ATTR_FEATURE_FLAGS: u16 = 143;
@@ -345,6 +353,22 @@ impl Kind {
     }
 }
 
+/// The OFDM rates, 6 to 54 Mbit/s in 500 kbit/s units: what every AWDL
+/// peer takes on 5 GHz (and 802.11g on 2.4 GHz).
+const OFDM_RATES: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
+
+/// `struct ieee80211_ht_cap` for a two-stream peer: LDPC, 20/40 MHz,
+/// short GI at both, RX STBC, 7935-byte A-MSDUs; A-MPDU 64 KB; MCS 0-15.
+/// The firmware's rate control works down from it to what the peer
+/// answers.
+const HT_CAP_2SS: [u8; 26] = [
+    0xef, 0x09, 0x17, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// `struct ieee80211_vht_cap` for a two-stream peer: VHT MCS 0-9 on two
+/// streams each way.
+const VHT_CAP_2SS: [u8; 12] = [0xb2, 0x59, 0x82, 0x0f, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+
 /// An nl80211 connection.
 pub struct Nl80211 {
     genl: Genl,
@@ -445,6 +469,44 @@ impl Nl80211 {
         let mut a = Attrs::new();
         a.u32(ATTR_IFINDEX, ifindex);
         self.genl.request(CMD_LEAVE_IBSS, 0, &a).map(drop)
+    }
+
+    /// Adds `mac` to the AP interface `ifindex` as an associated,
+    /// authorized station with WMM and two-stream HT (and VHT on 5 GHz), as
+    /// if it had joined. The firmware then has a station entry for it, and
+    /// sends frames to it from its fast path with its own rate control: an
+    /// MT7922 took 5-14 ms over each frame injected to an unknown address,
+    /// against 0.4 ms to a station.
+    pub fn new_station(
+        &mut self,
+        ifindex: u32,
+        mac: MacAddr,
+        aid: u16,
+        vht: bool,
+    ) -> io::Result<()> {
+        // NL80211_STA_FLAG_{AUTHORIZED, WME, AUTHENTICATED, ASSOCIATED}.
+        let flags: u32 = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7);
+        let mut sta_flags = [0u8; 8];
+        sta_flags[..4].copy_from_slice(&flags.to_le_bytes());
+        sta_flags[4..].copy_from_slice(&flags.to_le_bytes());
+        let mut a = Attrs::new();
+        a.u32(ATTR_IFINDEX, ifindex)
+            .bytes(ATTR_MAC, &mac.0)
+            .u16(ATTR_STA_AID, aid)
+            .u16(ATTR_STA_LISTEN_INTERVAL, 10)
+            .bytes(ATTR_STA_SUPPORTED_RATES, &OFDM_RATES)
+            .bytes(ATTR_HT_CAPABILITY, &HT_CAP_2SS)
+            .bytes(ATTR_STA_FLAGS2, &sta_flags);
+        if vht {
+            a.bytes(ATTR_VHT_CAPABILITY, &VHT_CAP_2SS);
+        }
+        self.genl.request(CMD_NEW_STATION, 0, &a).map(drop)
+    }
+
+    pub fn del_station(&mut self, ifindex: u32, mac: MacAddr) -> io::Result<()> {
+        let mut a = Attrs::new();
+        a.u32(ATTR_IFINDEX, ifindex).bytes(ATTR_MAC, &mac.0);
+        self.genl.request(CMD_DEL_STATION, 0, &a).map(drop)
     }
 
     /// Drops a station's association.

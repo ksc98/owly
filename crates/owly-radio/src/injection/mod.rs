@@ -117,10 +117,17 @@ impl Awdl for Native {
 }
 
 /// Starts AWDL on the monitor interface (the first argument), making the
-/// second, `awdl0`, and publishing its valid peers on the last. Blocking.
+/// second, `awdl0`, with peers as stations on the third, the hidden AP if
+/// there is one, and publishing its valid peers on the last. Blocking.
 /// owly-awdl's [`Native`] outside tests.
 pub type StartAwdl = Arc<
-    dyn Fn(&str, &str, owly_awdl::Config, watch::Sender<Vec<PeerInfo>>) -> io::Result<Box<dyn Awdl>>
+    dyn Fn(
+            &str,
+            &str,
+            Option<&str>,
+            owly_awdl::Config,
+            watch::Sender<Vec<PeerInfo>>,
+        ) -> io::Result<Box<dyn Awdl>>
         + Send
         + Sync,
 >;
@@ -144,8 +151,8 @@ struct Live {
 
 impl Injection {
     pub fn new(ops: Arc<dyn Ops>, settings: Settings) -> Self {
-        let start: StartAwdl = Arc::new(|monitor, tap, cfg, peers| {
-            Ok(Box::new(Native::start(monitor, tap, cfg, peers)?))
+        let start: StartAwdl = Arc::new(|monitor, tap, ap, cfg, peers| {
+            Ok(Box::new(Native::start(monitor, tap, ap, cfg, peers)?))
         });
         Injection::with_awdl(ops, settings, start)
     }
@@ -234,8 +241,9 @@ impl Injection {
         let cfg = prepared.awdl;
         let mac = cfg.addr;
         let start = self.start_awdl.clone();
+        let ap = prepared.hostapd.is_some().then_some(AP);
         let started =
-            tokio::task::spawn_blocking(move || start(MONITOR, AWDL_IFACE, cfg, peers_tx))
+            tokio::task::spawn_blocking(move || start(MONITOR, AWDL_IFACE, ap, cfg, peers_tx))
                 .await
                 .map_err(|e| Error::no_radio(e.to_string()))?;
         let node = match started {

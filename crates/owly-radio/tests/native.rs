@@ -144,7 +144,7 @@ fn the_kernel_reaches_a_phone_through_the_native_driver() {
     let (peers_tx, mut peers) = watch::channel(Vec::new());
     let mut cfg = Config::new(US, "owly-test", radio());
     cfg.rssi_threshold = None;
-    let native = Native::start(MONITOR, TAP, cfg, peers_tx).expect("the driver starts");
+    let native = Native::start(MONITOR, TAP, None, cfg, peers_tx).expect("the driver starts");
 
     // AWDL-2, NET-1: awdl0 on our address, with its usable link-local one.
     assert_eq!(ops.mac(TAP).map(|m| m.0), Some(US.0));

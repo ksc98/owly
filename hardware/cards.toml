@@ -177,8 +177,8 @@ tested_on = ["`14c3:7961`, CachyOS (kernel 7.2.9)"]
 name = "MediaTek MT7922 (RZ616)"
 driver = "mt7921e"
 ids = ["14c3:0616"]
-status = "⚠️ Exclusive, opt-in; shared fails ([#14](https://github.com/t4t5/owly/issues/14))"
-tested_on = ["Minisforum MS-A2, `14c3:0616`, NixOS 26.05 (kernels 6.18 and 7.2.5)"]
+status = "⚠️ Exclusive, opt-in: sends to an iPhone at about 2 MB/s on 149; receiving untested; shared fails ([#14](https://github.com/t4t5/owly/issues/14))"
+tested_on = ["Minisforum MS-A2, `14c3:0616`, NixOS 26.05 (kernels 6.18 and 7.2.5)", "`14c3:0616`, CachyOS (kernel 7.3.5)"]
 
 [[card]]
 name = "MediaTek MT7927"
