@@ -32,6 +32,10 @@ const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// A write the receiver doesn't take in this long fails the transfer, so a
 /// receiver that stops reading can't hold the sender forever (SEC-10).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound TLS close_notify on teardown: on a dead link whose kernel send
+/// buffer is already full, an unbounded `shutdown()` blocks until TCP's
+/// retransmission limit expires.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What to send.
 #[derive(Debug, Clone)]
@@ -100,7 +104,7 @@ impl Sender {
         })
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-        let _ = tls.shutdown().await;
+        shutdown(&mut tls).await;
         Ok(sender::parse_discover_response(&response))
     }
 
@@ -171,7 +175,7 @@ impl Sender {
                         }
                     }
                     Action::Done(outcome) => {
-                        let _ = tls.shutdown().await;
+                        shutdown(&mut tls).await;
                         return Ok(outcome);
                     }
                 }
@@ -244,6 +248,12 @@ async fn write<S: AsyncWriteExt + Unpin>(stream: &mut S, bytes: &[u8]) -> io::Re
     timeout(WRITE_TIMEOUT, written)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the receiver stopped reading"))?
+}
+
+/// Sends TLS close_notify if the peer is still reachable, without blocking
+/// forever when the socket's send buffer is wedged on a dead link.
+async fn shutdown<S: AsyncWriteExt + Unpin>(stream: &mut S) {
+    let _ = timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
 }
 
 /// DVZip unless the receiver's TXT `flags` leave it out. Flags with neither
@@ -487,6 +497,36 @@ mod tests {
         let e = write(&mut ours, &[0; 4096]).await.unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), WRITE_TIMEOUT);
+    }
+
+    // spec: SEC-10
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_bounds_a_stalled_close_notify() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+
+        struct StuckShutdown;
+        impl AsyncWrite for StuckShutdown {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        let mut stream = StuckShutdown;
+        let started = Instant::now();
+        shutdown(&mut stream).await;
+        assert_eq!(started.elapsed(), SHUTDOWN_TIMEOUT);
     }
 
     // spec: UP-1b, MDNS-5

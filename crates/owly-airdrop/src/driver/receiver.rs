@@ -24,6 +24,9 @@ use crate::proto::messages::{AskRequest, DiscoverRequest, Offer};
 use crate::proto::receiver::{Answer, Config, Connection, Event};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound final error/close writes so a peer that stopped reading can't hold
+/// a connection slot open after teardown begins.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Most connections from one address at a time.
 const MAX_PER_PEER: usize = 4;
 /// An upload must bring at least this much in every `RATE_WINDOW`, about
@@ -406,7 +409,7 @@ impl Task {
                         let _ = self.events.send(ReceiverEvent::Failed { id, reason }).await;
                     }
                     Event::Close => {
-                        let _ = tls.shutdown().await;
+                        let _ = timeout(SHUTDOWN_TIMEOUT, tls.shutdown()).await;
                         return Ok(());
                     }
                 }
@@ -484,15 +487,18 @@ impl Task {
         id: u64,
         e: io::Error,
     ) -> io::Result<()> {
-        let _ = tls
-            .write_all(&crate::proto::http::response(
-                500,
-                &[("Connection", "close")],
-                b"",
-            ))
-            .await;
-        let _ = tls.flush().await;
-        let _ = tls.shutdown().await;
+        let _ = timeout(SHUTDOWN_TIMEOUT, async {
+            let _ = tls
+                .write_all(&crate::proto::http::response(
+                    500,
+                    &[("Connection", "close")],
+                    b"",
+                ))
+                .await;
+            let _ = tls.flush().await;
+            let _ = tls.shutdown().await;
+        })
+        .await;
         let _ = self
             .events
             .send(ReceiverEvent::Failed {
