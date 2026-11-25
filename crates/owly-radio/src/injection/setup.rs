@@ -242,7 +242,15 @@ impl Setup<'_> {
         if let Some(no_ack) = self.station.quirk.tx_noack {
             awdl.no_ack = no_ack;
         }
-        awdl.amsdu = self.settings.tx_amsdu;
+        awdl.amsdu = self
+            .settings
+            .tx_amsdu
+            .unwrap_or(self.station.quirk.tx_amsdu);
+        awdl.max_frame = self
+            .station
+            .quirk
+            .max_tx_frame
+            .unwrap_or(crate::native::MONITOR_MAX_FRAME);
         awdl.unicast_groups = self.station.quirk.unicast_groups;
         Prepared {
             mode,

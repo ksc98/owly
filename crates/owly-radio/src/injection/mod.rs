@@ -86,8 +86,8 @@ pub struct Settings {
     pub aggregation: Option<bool>,
     /// The data frame rate.
     pub tx_rate: Option<owly_awdl::TxRate>,
-    /// Unicast as A-MSDUs, where the peer takes them.
-    pub tx_amsdu: bool,
+    /// Overrides the quirk's `tx_amsdu`: unicast as A-MSDUs where the peer takes them.
+    pub tx_amsdu: Option<bool>,
     pub hostapd: PathBuf,
     pub quirks: Quirks,
     pub run_dir: RunDir,

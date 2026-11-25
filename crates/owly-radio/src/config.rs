@@ -42,8 +42,7 @@ pub struct Config {
     pub aggregation: Option<bool>,
     pub tx_rate: Option<String>,
     pub hostapd: Option<PathBuf>,
-    #[serde(default)]
-    pub tx_amsdu: bool,
+    pub tx_amsdu: Option<bool>,
 }
 
 impl Config {

@@ -38,10 +38,17 @@
 #                peer visits a fixed radio's channel for a slot or two, and a
 #                frame retried past the visit holds up every frame behind it;
 #                Intel and MT76x2U TX status also stalls after channel changes
+#   tx_amsdu     coalesce unicast packets to one peer into 802.11 A-MSDUs
+#                where the peer accepts them (default false)
 #   supports_tx_ldpc
 #                the driver can LDPC-encode injected frames, for owly-awdl's
 #                rate selection (not used yet)
 #                (default false)
+#   max_tx_frame largest 802.11 frame (MAC header included) the driver can
+#                inject in one linear skb; unset, the monitor interface's MTU
+#                decides. MediaTek connac2/3 PCIe TXP descriptors carry a
+#                12-bit buffer length (4095 bytes max), so larger A-MSDUs
+#                would be truncated and fail DMA unmap
 #   issues       known problems, one sentence each, which the probe reports
 #   notes        the hardware, and what was observed
 
@@ -50,6 +57,7 @@ status = "tested"
 mode = "shared"
 reconnect_after_monitor = true
 mt76_pm_off = true
+max_tx_frame = 3865
 issues = [
     "This card sends more slowly than it receives (about 490 kB/s against 1.3 MB/s), since its injected frames leave at most one every 2.5 ms or so.",
     "This card's Wi-Fi stops receiving after a monitor interface is removed (an mt76 firmware bug), so Owly reconnects it at the end of every session.",
@@ -61,6 +69,7 @@ status = "broken"
 mode = "shared"
 reconnect_after_monitor = true
 mt76_pm_off = true
+max_tx_frame = 3865
 issues = [
     "The MT7927 starts in shared mode but its monitor interface never hears the phone. As an active monitor it's heard and can send, but the phone's uploads arrive at about 5 kB/s and time out (https://github.com/t4t5/owly/issues/44). Exclusive mode through a hidden AP is untested.",
 ]
@@ -70,7 +79,9 @@ notes = "MediaTek MT7927 (TP-Link Archer TBE550E, 14c3:7927, kernel 7.2.9), on t
 status = "untested"
 mode = "exclusive"
 channels = [149, 44, 6]
-notes = "MediaTek MT7921 (14c3:7961) and MT7922 (14c3:0616). No ad-hoc mode, so exclusive mode runs a hidden AP. Kernel 7.3 stopped advertising active monitor on mt792x (commit 6f6c9800e54c: the firmware stops receiving in that mode). MT7922 on kernel 7.3.5, channel 149, with each peer a station on the AP: 6 MB to an iPhone in 2.8 s, no retries. Without the station entries the firmware held each injected frame 5-14 ms and an upload ran at about 60 KB/s. Shared mode fails (https://github.com/t4t5/owly/issues/14)."
+tx_amsdu = true
+max_tx_frame = 3865
+notes = "MediaTek MT7921 (14c3:7961) and MT7922 (14c3:0616). No ad-hoc mode, so exclusive mode runs a hidden AP. Kernel 7.3 stopped advertising active monitor on mt792x (commit 6f6c9800e54c: the firmware stops receiving in that mode). MT7922 on kernel 7.3.5, channel 149, with each peer a station on the AP: 6 MB to an iPhone in 2.8 s without A-MSDU, and 30 MiB random data in 8.5 s (3.7 MB/s) with 2-packet A-MSDUs capped at 3865 B (under mt76_connac's 4095-byte 12-bit TXP buffer length limit). Without the station entries the firmware held each injected frame 5-14 ms and an upload ran at about 60 KB/s. Shared mode fails (https://github.com/t4t5/owly/issues/14)."
 
 [drivers.mt76x2u]
 status = "tested"

@@ -40,6 +40,10 @@ pub struct Quirk {
     /// monitor), as legacy did, and not in shared mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_noack: Option<bool>,
+    /// Coalesce unicast packets to a peer into 802.11 A-MSDUs where the peer
+    /// accepts them (default false).
+    #[serde(default)]
+    pub tx_amsdu: bool,
     /// The driver can encode injected frames with LDPC. For owly-awdl's rate
     /// selection, which doesn't use it yet.
     #[serde(default)]
@@ -52,6 +56,13 @@ pub struct Quirk {
     /// firmware stops sending to its stations from the cell's first beacon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ibss_rejoin_secs: Option<u64>,
+    /// Largest 802.11 frame the driver can inject in one linear skb. Unset,
+    /// the monitor interface's MTU sets the limit. MediaTek connac2/3 PCIe
+    /// drivers (`mt76_connac_write_hw_txp`) store the buffer length in a
+    /// 12-bit field (4095 bytes); larger frames are truncated on TX and
+    /// unmapped with the wrong DMA size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tx_frame: Option<usize>,
     /// Known problems on this hardware, one sentence each, for the person
     /// at the computer. The probe reports them.
     #[serde(default)]
@@ -167,6 +178,11 @@ impl Quirk {
         if self.ibss_rejoin_secs == Some(0) {
             return Err("ibss_rejoin_secs must be greater than zero".into());
         }
+        if let Some(max) = self.max_tx_frame
+            && max < 1500
+        {
+            return Err(format!("max_tx_frame ({max}) must be at least 1500"));
+        }
         Ok(())
     }
 }
@@ -213,6 +229,11 @@ mod tests {
         let (mt7921, _) = quirks.get("mt7921e", None);
         assert_eq!(mt7921.mode, Mode::Exclusive);
         assert_eq!(mt7921.channels, [149, 44, 6]);
+        assert!(mt7921.tx_amsdu);
+        assert_eq!(mt7921.max_tx_frame, Some(3865));
+        let (mt7925, _) = quirks.get("mt7925e", None);
+        assert!(!mt7925.tx_amsdu);
+        assert_eq!(mt7925.max_tx_frame, Some(3865));
     }
 
     #[test]
@@ -295,6 +316,8 @@ mod tests {
         assert!(Quirks::parse(&ok).is_ok());
         assert!(Quirks::parse(&ok.replace("shared", "sharde")).is_err());
         assert!(Quirks::parse(&format!("{ok}channels = [36]\n")).is_err());
+        assert!(Quirks::parse(&format!("{ok}max_tx_frame = 1000\n")).is_err());
+        assert!(Quirks::parse(&format!("{ok}max_tx_frame = 3865\n")).is_ok());
         assert!(Quirks::parse(&ok.replace("shared", "active-monitor")).is_ok());
     }
 }

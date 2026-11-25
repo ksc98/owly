@@ -33,6 +33,9 @@ pub const TAP_MTU: u32 = 1450;
 pub const MONITOR_MTU: u32 = 8192;
 /// The most a radiotap header of ours takes.
 const RADIOTAP_MAX: usize = 16;
+/// The largest 802.11 frame that fits in [`MONITOR_MTU`] behind a radiotap
+/// header.
+pub const MONITOR_MAX_FRAME: usize = MONITOR_MTU as usize - RADIOTAP_MAX;
 
 /// A running node.
 pub struct Native {
@@ -61,8 +64,9 @@ impl Native {
             .ok()
             .and_then(|m| m.trim().parse::<usize>().ok())
             .unwrap_or(2304);
+        let monitor_max = monitor_mtu.saturating_sub(RADIOTAP_MAX).max(1500);
         let mut cfg = cfg;
-        cfg.max_frame = monitor_mtu.saturating_sub(RADIOTAP_MAX).max(1500);
+        cfg.max_frame = cfg.max_frame.min(monitor_max).max(1500);
 
         let air = packet_socket(monitor_index, false)?;
         let tap_fd = open_tap(tap)?;

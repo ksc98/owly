@@ -439,7 +439,7 @@ impl Fx {
             channels: None,
             aggregation: None,
             tx_rate: None,
-            tx_amsdu: false,
+            tx_amsdu: None,
             hostapd: self.dir.path().join("hostapd"),
             quirks: Quirks::load(Path::new("/nonexistent")).unwrap(),
             run_dir: self.run(),
@@ -706,6 +706,7 @@ async fn shared_mode_comes_up_and_goes_back() {
     assert_eq!(awdl.addr, station_mac);
     assert!(!awdl.no_ack && !awdl.accept_addba);
     assert_eq!(awdl.rate, TxRate::BASIC);
+    assert_eq!(awdl.max_frame, 3865);
     let calls = fx.ops.calls();
     assert_eq!(
         calls,
@@ -774,6 +775,7 @@ async fn exclusive_mode_runs_an_ad_hoc_cell() {
     assert_eq!(awdl.radio.presence, Presence::Fixed);
     assert_eq!(awdl.radio.presence.ranking(), Ranking::MetricFirst);
     assert!(awdl.no_ack && !awdl.accept_addba);
+    assert_eq!(awdl.max_frame, owly_radio::native::MONITOR_MAX_FRAME);
     let calls = fx.ops.calls();
     assert_eq!(
         calls[..10],
@@ -1284,4 +1286,33 @@ fn a_dead_holders_process_is_stopped_by_its_step() {
     reaper.join().unwrap().unwrap();
     assert!(!process.alive());
     assert_eq!(fx.journal(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mt7921e_enables_bounded_amsdus_and_radio_toml_can_override() {
+    let fx = Fx::with(|o| {
+        o.driver = "mt7921e".into();
+        o.device = Some("14c3:0616".into());
+        o.wiphy
+            .lock()
+            .unwrap()
+            .iftypes
+            .retain(|t| *t != IfType::Adhoc);
+    });
+    let mut settings = fx.settings();
+    settings.allow_untested = true;
+    let mut backend = fx.backend_with(settings.clone());
+    backend.up().await.unwrap();
+    let awdl = fx.awdl();
+    assert!(awdl.amsdu);
+    assert_eq!(awdl.max_frame, 3865);
+    backend.down().await.unwrap();
+    drop(backend);
+
+    // radio.toml overrides the quirk's tx_amsdu.
+    settings.tx_amsdu = Some(false);
+    let mut backend = fx.backend_with(settings);
+    backend.up().await.unwrap();
+    assert!(!fx.awdl().amsdu);
+    backend.down().await.unwrap();
 }
